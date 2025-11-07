@@ -76,7 +76,9 @@ class ObjectLoaderPartLoader<T : RemoteObject<*>>(
     ) : PartResult<T> {
         override val state: BatchState = BatchState.STAGED
     }
-    data class NoPart<T : RemoteObject<*>>(override val objectKey: String) : PartResult<T> {
+    data class NoPart<T : RemoteObject<*>>(
+        override val objectKey: String
+    ) : PartResult<T> {
         override val state: BatchState = BatchState.STAGED
     }
 

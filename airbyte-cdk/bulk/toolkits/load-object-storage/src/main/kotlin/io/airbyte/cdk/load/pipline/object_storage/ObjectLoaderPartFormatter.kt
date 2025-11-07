@@ -8,6 +8,9 @@ import io.airbyte.cdk.load.command.DestinationCatalog
 import io.airbyte.cdk.load.command.DestinationStream
 import io.airbyte.cdk.load.file.object_storage.BufferedFormattingWriter
 import io.airbyte.cdk.load.file.object_storage.BufferedFormattingWriterFactory
+import io.airbyte.cdk.load.file.object_storage.DocumentMetadata
+import io.airbyte.cdk.load.file.object_storage.DocumentMetadataExtractor
+import io.airbyte.cdk.load.file.object_storage.DocumentUploadNotifier
 import io.airbyte.cdk.load.file.object_storage.Part
 import io.airbyte.cdk.load.file.object_storage.PartFactory
 import io.airbyte.cdk.load.file.object_storage.PathFactory
@@ -41,6 +44,7 @@ class ObjectLoaderPartFormatter<T : OutputStream>(
     private val loader: ObjectLoader,
     // TODO: This doesn't need to be "DestinationState", just a couple of utility classes
     private val stateManager: DestinationStateManager<ObjectStorageDestinationState>,
+    private val uploadNotifier: DocumentUploadNotifier,
     @Value("\${airbyte.destination.core.record-batch-size-override:null}")
     val batchSizeOverride: Long? = null,
     @Named("objectLoaderClampedPartSizeBytes") val clampedPartSizeBytes: Long
@@ -59,7 +63,8 @@ class ObjectLoaderPartFormatter<T : OutputStream>(
     data class State<T : OutputStream>(
         val stream: DestinationStream,
         val writer: BufferedFormattingWriter<T>,
-        val partFactory: PartFactory
+        val partFactory: PartFactory,
+        var currentObjectKey: String? = null
     ) : AutoCloseable {
         override fun close() {
             writer.close()
@@ -118,7 +123,13 @@ class ObjectLoaderPartFormatter<T : OutputStream>(
                 state.writer.takeBytes()
             }
         val part = state.partFactory.nextPart(bytes, isFinal)
-        log.debug { "Creating part $part" }
+        
+        // Store the current object key for later reference
+        if (isFinal) {
+            state.currentObjectKey = part.key
+        }
+        
+        log.debug { "Creating part ${part.key} (isFinal=$isFinal)" }
         return FormattedPart(part)
     }
 
@@ -136,6 +147,23 @@ class ObjectLoaderPartFormatter<T : OutputStream>(
         input: DestinationRecordRaw,
         state: State<T>
     ): BatchAccumulatorResult<State<T>, FormattedPart> {
+        // Extract metadata from THIS record (each record = different source document)
+        // and notify middleware immediately
+        val internalPath = state.partFactory.key // The JSONL file path where this will be stored
+        val metadata = DocumentMetadataExtractor.extractFromRecord(input, internalPath)
+        
+        if (metadata != null) {
+            log.info { "!!!!HARSH's " +
+                "Notifying middleware for document from stream ${state.stream.mappedDescriptor}: " +
+                "name=${metadata.name}, sourcePath=${metadata.sourcePath}, " +
+                "internalPath=${metadata.internalPath}, hasEssential=${metadata.hasEssentialMetadata()}"
+            }
+            // Notify immediately for this document
+            uploadNotifier.notifyUploadComplete(metadata)
+        } else {
+            log.warn { "!!!!HARSH's Failed to extract metadata from record in stream ${state.stream.mappedDescriptor}" }
+        }
+        
         state.writer.accept(input)
         val dataSufficient =
             state.writer.bufferSize >= clampedPartSizeBytes || batchSizeOverride != null

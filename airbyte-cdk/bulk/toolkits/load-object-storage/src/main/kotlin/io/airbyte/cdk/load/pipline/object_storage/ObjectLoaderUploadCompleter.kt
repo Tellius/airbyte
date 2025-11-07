@@ -21,7 +21,9 @@ import jakarta.inject.Singleton
 // TODO: Add unit tests
 @Singleton
 @Requires(bean = ObjectLoader::class)
-class ObjectLoaderUploadCompleter<T : RemoteObject<*>>(val objectLoader: ObjectLoader) :
+class ObjectLoaderUploadCompleter<T : RemoteObject<*>>(
+    val objectLoader: ObjectLoader,
+) :
     BatchAccumulator<
         ObjectLoaderUploadCompleter.State,
         ObjectKey,
@@ -30,14 +32,19 @@ class ObjectLoaderUploadCompleter<T : RemoteObject<*>>(val objectLoader: ObjectL
     > {
     private val log = KotlinLogging.logger {}
 
-    data class State(val objectKey: String, val partBookkeeper: PartBookkeeper) : AutoCloseable {
+    data class State(
+        val objectKey: String,
+        val partBookkeeper: PartBookkeeper,
+    ) : AutoCloseable {
         override fun close() {
             // Do Nothing
         }
     }
 
-    data class UploadResult<T>(override val state: BatchState, val remoteObject: T?) :
-        WithBatchState
+    data class UploadResult<T>(
+        override val state: BatchState,
+        val remoteObject: T?,
+    ) : WithBatchState
 
     override suspend fun start(key: ObjectKey, part: Int): State {
         val bookkeeper = PartBookkeeper()
@@ -73,6 +80,7 @@ class ObjectLoaderUploadCompleter<T : RemoteObject<*>>(val objectLoader: ObjectL
                         "Loaded part ${input.partIndex} (isFinal=${input.isFinal}) completes ${state.objectKey}, finishing (state $state)"
                     }
                     val obj = input.upload.await().complete()
+                    
                     FinalOutput(UploadResult(objectLoader.stateAfterUpload, obj))
                 } else {
                     log.debug {
@@ -95,6 +103,7 @@ class ObjectLoaderUploadCompleter<T : RemoteObject<*>>(val objectLoader: ObjectL
         }
 
         // Everything we received before end-of-stream was a no-op. Return a dummy output.
+        log.debug { "Finishing upload completer with no work completed. ObjectKey=${state.objectKey}" }
         return FinalOutput(UploadResult(objectLoader.stateAfterUpload, null))
     }
 }
