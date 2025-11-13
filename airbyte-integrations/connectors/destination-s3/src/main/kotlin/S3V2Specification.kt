@@ -4,6 +4,7 @@
 
 package io.airbyte.integrations.destination.s3_v2
 
+import com.fasterxml.jackson.annotation.JsonPropertyDescription
 import com.kjetland.jackson.jsonSchema.annotations.JsonSchemaInject
 import com.kjetland.jackson.jsonSchema.annotations.JsonSchemaTitle
 import io.airbyte.cdk.command.ConfigurationSpecification
@@ -75,6 +76,13 @@ class S3V2Specification :
             "{\"examples\":[\"{date}\",\"{date:yyyy_MM}\",\"{timestamp}\",\"{part_number}\",\"{sync_id}\"],\"order\":9}"
     )
     override val fileNamePattern: String? = null
+
+    @get:JsonSchemaInject(
+        json =
+            """{"examples":["550e8400-e29b-41d4-a716-446655440000"],"order":10,"airbyte_hidden":false}"""
+    )
+    @get:JsonPropertyDescription("Tellius datasource ID for middleware integration (set to connection UUID)")
+    val datasourceId: String? = null
 }
 
 @Singleton

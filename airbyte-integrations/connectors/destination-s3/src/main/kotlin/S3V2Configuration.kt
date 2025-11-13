@@ -22,6 +22,7 @@ import io.airbyte.cdk.load.command.object_storage.ObjectStorageUploadConfigurati
 import io.airbyte.cdk.load.command.s3.S3BucketConfiguration
 import io.airbyte.cdk.load.command.s3.S3BucketConfigurationProvider
 import io.micronaut.context.annotation.Factory
+import jakarta.inject.Named
 import jakarta.inject.Singleton
 import java.io.OutputStream
 
@@ -48,6 +49,9 @@ data class S3V2Configuration<T : OutputStream>(
     val maxMemoryRatioReservedForParts: Double = DEFAULT_MAX_MEMORY_RESERVED_FOR_PARTS,
     val objectSizeBytes: Long = 200L * 1024 * 1024,
     val partSizeBytes: Long = 20L * 1024 * 1024,
+
+    // Middleware integration
+    val datasourceId: String? = null,
 ) :
     DestinationConfiguration(),
     AWSAccessKeyConfigurationProvider,
@@ -74,7 +78,8 @@ class S3V2ConfigurationFactory(private val destinationCatalog: DestinationCatalo
                     FILE_DEFAULT_MAX_MEMORY_RESERVED_FOR_PARTS
                 } else {
                     DEFAULT_MAX_MEMORY_RESERVED_FOR_PARTS
-                }
+                },
+            datasourceId = pojo.datasourceId,
         )
     }
 }
@@ -86,4 +91,11 @@ class S3V2ConfigurationProvider<T : OutputStream>(private val config: Destinatio
     fun get(): S3V2Configuration<T> {
         return config as S3V2Configuration<T>
     }
+}
+
+@Factory
+class S3V2DependencyProvider {
+    @Singleton
+    @Named("datasourceId")
+    fun provideDatasourceId(config: S3V2Configuration<*>): String? = config.datasourceId
 }

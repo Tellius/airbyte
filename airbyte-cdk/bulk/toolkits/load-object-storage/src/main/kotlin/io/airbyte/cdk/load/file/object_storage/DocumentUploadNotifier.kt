@@ -5,6 +5,7 @@
 package io.airbyte.cdk.load.file.object_storage
 
 import io.github.oshai.kotlinlogging.KotlinLogging
+import jakarta.inject.Named
 import jakarta.inject.Singleton
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -13,11 +14,15 @@ import kotlinx.coroutines.launch
 /**
  * Service responsible for notifying the middleware API about uploaded documents.
  * Notifications are sent asynchronously and failures do not affect the sync.
+ * 
+ * @param datasourceId Optional datasource ID for middleware integration (injected via DI)
  */
 @Singleton
-class DocumentUploadNotifier {
+class DocumentUploadNotifier(
+    @Named("datasourceId") private val datasourceId: String? = null
+) {
     private val log = KotlinLogging.logger {}
-    private val apiClient = MiddlewareApiClient()
+    private val apiClient = MiddlewareApiClient(datasourceId)
     private val scope = CoroutineScope(Dispatchers.IO)
 
     /**

@@ -4,6 +4,8 @@
 
 package io.airbyte.cdk.load.file.object_storage
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.node.ObjectNode
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -11,22 +13,65 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.time.Duration
 import java.util.UUID
 
 /**
+ * Data class representing the owner of a datasource from middleware API.
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class DatasourceOwner(
+    @JsonProperty("id") val id: String,
+    @JsonProperty("username") val username: String,
+    @JsonProperty("firstName") val firstName: String,
+    @JsonProperty("lastName") val lastName: String,
+    @JsonProperty("email") val email: String
+)
+
+/**
+ * Data class representing a datasource response from middleware API.
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class DatasourceResponse(
+    @JsonProperty("id") val id: String,
+    @JsonProperty("name") val name: String,
+    @JsonProperty("type") val type: String,
+    @JsonProperty("owner") val owner: DatasourceOwner
+)
+
+/**
  * HTTP client for calling the middleware service to notify about uploaded documents.
  * This is a hard-coded integration point for Tellius middleware service.
+ * 
+ * @param datasourceId Optional datasource ID to fetch owner information for middleware integration
  */
-class MiddlewareApiClient {
+class MiddlewareApiClient(private val datasourceId: String? = null) {
     private val log = KotlinLogging.logger {}
     private val httpClient: HttpClient = HttpClient.newBuilder()
+        .version(HttpClient.Version.HTTP_1_1)  // Force HTTP/1.1 (middleware has issues with HTTP/2)
         .connectTimeout(Duration.ofSeconds(30))
         .build()
     private val objectMapper = ObjectMapper()
+    
+    // Cached owner information from datasource lookup
+    private var cachedUserId: String? = null
+    private var cachedDatasourceId: String? = null
+
+    init {
+        if (datasourceId != null) {
+            try {
+                fetchDatasourceOwner()
+            } catch (e: Exception) {
+                log.error(e) { "!!!!HARSH's Failed to fetch datasource owner for ID: $datasourceId" }
+                throw RuntimeException("Failed to initialize middleware client: Unable to fetch datasource owner", e)
+            }
+        }
+    }
 
     companion object {
-        private const val MIDDLEWARE_URL = "http://middleware-service:8082/unstructure/documents"
+        private const val MIDDLEWARE_URL_BASE = "http://middleware-service:8082/unstructure"
         
         // Hard-coded headers as per curl specification
         private const val HEADER_ACCEPT = "application/json, text/plain, */*"
@@ -68,15 +113,33 @@ class MiddlewareApiClient {
 
         return try {
             val payload = buildPayload(metadata)
-            
-            log.info { "!!!!HARSH's " +
-                "Calling middleware API for document: ${metadata.name} at ${metadata.internalPath}" 
-            }
-            log.info { "!!!!HARSH's " +  "API payload: $payload" }
-            
             val request = buildRequest(payload)
             
-            log.info { "!!!!HARSH's " + "Sending HTTP request to $MIDDLEWARE_URL" }
+            // Build complete HTTP request representation for logging
+            val requestHeaders = StringBuilder()
+            request.headers().map().forEach { (name, values) ->
+                values.forEach { value ->
+                    requestHeaders.append("  $name: $value\n")
+                }
+            }
+            
+            val userIdInfo = if (cachedUserId != null) {
+                "fetched from datasource (owner: $cachedUserId)"
+            } else {
+                "using fallback TELLIUS_SUPERUSER_ID"
+            }
+            
+            log.info { "!!!!HARSH's v7 " +
+                "========== MIDDLEWARE API REQUEST ==========\n" +
+                "Document: ${metadata.name}\n" +
+                "USERID: $userIdInfo (sent in header only, not in payload)\n" +
+                "Method: ${request.method()}\n" +
+                "URL: ${request.uri()}\n" +
+                "Headers:\n$requestHeaders" +
+                "Payload:\n$payload\n" +
+                "============================================"
+            }
+            
             val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
             
             if (response.statusCode() in 200..299) {
@@ -102,48 +165,163 @@ class MiddlewareApiClient {
     }
 
     /**
+     * Fetch datasource owner information from the middleware API.
+     * This is called once during initialization if datasourceId is provided.
+     */
+    private fun fetchDatasourceOwner() {
+        log.info { "!!!!HARSH's Fetching datasource owner for ID: $datasourceId" }
+        
+        val url = "$MIDDLEWARE_URL_BASE/datasources/$datasourceId"
+        val request = HttpRequest.newBuilder()
+            .uri(URI.create(url))
+            .version(HttpClient.Version.HTTP_1_1)
+            .header("Content-Type", HEADER_CONTENT_TYPE)
+            .header("Authorization", HEADER_AUTHORIZATION)
+            .header("USERID", HEADER_USERID)
+            .GET()
+            .timeout(Duration.ofSeconds(30))
+            .build()
+        
+        log.info { "!!!!HARSH's Datasource lookup - GET $url" }
+        
+        val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
+        
+        if (response.statusCode() != 200) {
+            throw RuntimeException("Failed to fetch datasource: HTTP ${response.statusCode()} - ${response.body()}")
+        }
+        
+        val datasourceResponse = objectMapper.readValue(response.body(), DatasourceResponse::class.java)
+        cachedUserId = datasourceResponse.owner.id
+        cachedDatasourceId = datasourceResponse.id
+        
+        log.info { "!!!!HARSH's Successfully fetched datasource owner - userId: $cachedUserId, datasourceId: $cachedDatasourceId" }
+    }
+
+    /**
      * Build the JSON payload for the API request.
      */
     private fun buildPayload(metadata: DocumentMetadata): String {
         val payload = objectMapper.createObjectNode()
         
-        // Generate a unique ID for this document notification
+        // Generate a NEW random UUID for this middleware entry
+        // Each sync creates a new entry with a unique ID
         payload.put("id", UUID.randomUUID().toString())
         
         // Add required fields
         payload.put("name", metadata.name ?: "unknown")
         payload.put("type", metadata.type ?: "unknown")
         payload.put("internal_path", metadata.internalPath ?: "")
-        payload.put("doc_updated_at", metadata.docUpdatedAt ?: "")
-        payload.put("file_size_bytes", metadata.fileSizeBytes)
+        
+        // Format timestamp to match middleware expectations (no timezone, with microseconds)
+        val formattedTimestamp = formatTimestampForMiddleware(metadata.docUpdatedAt)
+        payload.put("doc_updated_at", formattedTimestamp ?: "")
+        
+        // Ensure file_size_bytes is an integer (not too large for Int type)
+        val fileSizeInt = if (metadata.fileSizeBytes > Int.MAX_VALUE) {
+            Int.MAX_VALUE
+        } else {
+            metadata.fileSizeBytes.toInt()
+        }
+        payload.put("file_size_bytes", fileSizeInt)
+        
         payload.put("source_path", metadata.sourcePath ?: "")
+        
+        // Add datasource_id if available from datasource lookup
+        // Note: user_id is sent in USERID header, NOT in payload
+        if (cachedDatasourceId != null) {
+            payload.put("datasource_id", cachedDatasourceId)
+        }
+        
+        // Add meta_data with deterministic UUID for tracking the source document
+        // This fingerprint stays the same across syncs for the same source document
+        val metaDataObject = objectMapper.createObjectNode()
+        val documentFingerprint = generateDeterministicUUID(
+            metadata.sourcePath ?: metadata.name ?: "unknown"
+        )
+        metaDataObject.put("document_fingerprint", documentFingerprint)
+        metaDataObject.put("airbyte_sync_timestamp", System.currentTimeMillis())
+        payload.set<ObjectNode>("meta_data", metaDataObject)
         
         return objectMapper.writeValueAsString(payload)
     }
+    
+    /**
+     * Generate a deterministic UUID v3 (MD5-based) as a document fingerprint.
+     * Same source document will always generate the same fingerprint UUID across syncs.
+     * This allows the middleware to track the same source document over multiple sync runs.
+     * 
+     * @param sourcePath The source path/identifier of the document (e.g., "water.pdf")
+     * @return A deterministic UUID string that serves as the document fingerprint
+     */
+    private fun generateDeterministicUUID(sourcePath: String): String {
+        // Generate MD5 hash of the source path
+        val md5 = MessageDigest.getInstance("MD5")
+        val hash = md5.digest(sourcePath.toByteArray(StandardCharsets.UTF_8))
+        
+        // Convert to UUID v3 format (MD5-based UUID)
+        // Set version bits (version 3 = MD5)
+        hash[6] = ((hash[6].toInt() and 0x0f) or 0x30).toByte()
+        // Set variant bits (RFC 4122 variant)
+        hash[8] = ((hash[8].toInt() and 0x3f) or 0x80).toByte()
+        
+        // Format as standard UUID string: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+        return "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x".format(
+            hash[0], hash[1], hash[2], hash[3],
+            hash[4], hash[5],
+            hash[6], hash[7],
+            hash[8], hash[9],
+            hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]
+        )
+    }
+    
+    /**
+     * Format timestamp to middleware expectations:
+     * "2025-10-31T15:42:30.123456" (no timezone, with microseconds)
+     */
+    private fun formatTimestampForMiddleware(timestamp: String?): String? {
+        if (timestamp.isNullOrBlank()) return null
+        
+        return try {
+            // Remove timezone indicators
+            var cleaned = timestamp
+                .replace("Z", "")
+                .replace("+00:00", "")
+                .replace(Regex("[+-]\\d{2}:\\d{2}$"), "")
+            
+            // Ensure microseconds are present
+            if (cleaned.contains(".")) {
+                val parts = cleaned.split(".")
+                if (parts.size == 2) {
+                    val fractional = parts[1].padEnd(6, '0').take(6)
+                    "${parts[0]}.$fractional"
+                } else {
+                    cleaned
+                }
+            } else {
+                // No fractional seconds, add .000000
+                "$cleaned.000000"
+            }
+        } catch (e: Exception) {
+            log.warn(e) { "Could not format timestamp: $timestamp" }
+            timestamp
+        }
+    }
 
     /**
-     * Build the HTTP request with all required headers.
+     * Build the HTTP request with only the essential headers.
+     * Unnecessary browser headers can cause middleware crashes.
+     * Uses the fetched user ID if available, otherwise falls back to TELLIUS_SUPERUSER_ID.
      */
     private fun buildRequest(payload: String): HttpRequest {
+        val url = "$MIDDLEWARE_URL_BASE/documents"
+        // Use cached user ID from datasource lookup if available, otherwise fall back to superuser
+        val userIdHeader = cachedUserId ?: HEADER_USERID
+        
         return HttpRequest.newBuilder()
-            .uri(URI.create(MIDDLEWARE_URL))
-            .header("Accept", HEADER_ACCEPT)
-            .header("Accept-Language", HEADER_ACCEPT_LANGUAGE)
-            .header("CSRF", HEADER_CSRF)
-            .header("Cache-Control", HEADER_CACHE_CONTROL)
-            .header("DNT", HEADER_DNT)
-            .header("Pragma", HEADER_PRAGMA)
-            .header("Referer", HEADER_REFERER)
-            .header("Sec-Fetch-Dest", HEADER_SEC_FETCH_DEST)
-            .header("Sec-Fetch-Mode", HEADER_SEC_FETCH_MODE)
-            .header("Sec-Fetch-Site", HEADER_SEC_FETCH_SITE)
-            .header("User-Agent", HEADER_USER_AGENT)
-            .header("sec-ch-ua", HEADER_SEC_CH_UA)
-            .header("sec-ch-ua-mobile", HEADER_SEC_CH_UA_MOBILE)
-            .header("sec-ch-ua-platform", HEADER_SEC_CH_UA_PLATFORM)
-            .header("Authorization", HEADER_AUTHORIZATION)
-            .header("USERID", HEADER_USERID)
+            .uri(URI.create(url))
             .header("Content-Type", HEADER_CONTENT_TYPE)
+            .header("Authorization", HEADER_AUTHORIZATION)
+            .header("USERID", userIdHeader)
             .POST(HttpRequest.BodyPublishers.ofString(payload))
             .timeout(Duration.ofSeconds(30))
             .build()
