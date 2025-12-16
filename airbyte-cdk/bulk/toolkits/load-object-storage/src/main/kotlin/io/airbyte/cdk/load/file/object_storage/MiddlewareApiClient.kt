@@ -64,7 +64,7 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
             try {
                 fetchDatasourceOwner()
             } catch (e: Exception) {
-                log.error(e) { "!!!!HARSH's Failed to fetch datasource owner for ID: $datasourceId" }
+                log.error(e) { "Failed to fetch datasource owner for ID: $datasourceId" }
                 throw RuntimeException("Failed to initialize middleware client: Unable to fetch datasource owner", e)
             }
         }
@@ -124,34 +124,36 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
             }
             
             val userIdInfo = if (cachedUserId != null) {
-                "fetched from datasource (owner: $cachedUserId)"
+                "from datasource owner (ID: $cachedUserId)"
             } else {
-                "using fallback TELLIUS_SUPERUSER_ID"
+                "fallback SUPERUSER"
             }
             
-            log.info { "!!!!HARSH's v7 " +
-                "========== MIDDLEWARE API REQUEST ==========\n" +
-                "Document: ${metadata.name}\n" +
-                "USERID: $userIdInfo (sent in header only, not in payload)\n" +
-                "Method: ${request.method()}\n" +
-                "URL: ${request.uri()}\n" +
+            log.info { 
+                "Sending document to middleware API:\n" +
+                "  Document: ${metadata.name}\n" +
+                "  User: $userIdInfo\n" +
+                "  Method: ${request.method()}\n" +
+                "  URL: ${request.uri()}"
+            }
+            
+            log.debug { 
+                "Request details:\n" +
                 "Headers:\n$requestHeaders" +
-                "Payload:\n$payload\n" +
-                "============================================"
+                "Payload:\n$payload"
             }
             
             val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
             
             if (response.statusCode() in 200..299) {
-                log.info { "!!!!HARSH's " +
-                    "Successfully notified middleware about document upload: ${metadata.name}, " +
-                    "status=${response.statusCode()}, response=${response.body()}"
+                log.info { 
+                    "Successfully notified middleware: ${metadata.name} (HTTP ${response.statusCode()})"
                 }
                 true
             } else {
-                log.info { "!!!!HARSH's " +
-                    "Middleware API returned non-success status: ${response.statusCode()}, " +
-                    "body: ${response.body()}" 
+                log.warn { 
+                    "Middleware returned non-success status: HTTP ${response.statusCode()}, " +
+                    "document: ${metadata.name}, body: ${response.body()}" 
                 }
                 false
             }
@@ -169,7 +171,7 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
      * This is called once during initialization if datasourceId is provided.
      */
     private fun fetchDatasourceOwner() {
-        log.info { "!!!!HARSH's Fetching datasource owner for ID: $datasourceId" }
+        log.info { "Fetching datasource owner for datasource ID: $datasourceId" }
         
         val url = "$MIDDLEWARE_URL_BASE/datasources/$datasourceId"
         val request = HttpRequest.newBuilder()
@@ -182,7 +184,7 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
             .timeout(Duration.ofSeconds(30))
             .build()
         
-        log.info { "!!!!HARSH's Datasource lookup - GET $url" }
+        log.debug { "Datasource lookup - GET $url" }
         
         val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
         
@@ -194,7 +196,7 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
         cachedUserId = datasourceResponse.owner.id
         cachedDatasourceId = datasourceResponse.id
         
-        log.info { "!!!!HARSH's Successfully fetched datasource owner - userId: $cachedUserId, datasourceId: $cachedDatasourceId" }
+        log.info { "Successfully fetched datasource owner - user ID: $cachedUserId, datasource ID: $cachedDatasourceId" }
     }
 
     /**

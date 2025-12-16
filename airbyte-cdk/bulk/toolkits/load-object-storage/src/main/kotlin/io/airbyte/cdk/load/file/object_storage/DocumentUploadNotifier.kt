@@ -31,24 +31,19 @@ class DocumentUploadNotifier(
      */
     fun notifyUploadComplete(metadata: DocumentMetadata?) {
         if (metadata == null) {
-            log.info { "!!!!HARSH's " + "Skipping middleware notification - no metadata available" }
+            log.debug { "Skipping middleware notification - no metadata available" }
             return
         }
 
-        log.info { "!!!!HARSH's " +
-            "Preparing to notify middleware about upload: " +
+        log.debug { 
+            "Preparing middleware notification: " +
             "name=${metadata.name}, type=${metadata.type}, " +
-            "internalPath=${metadata.internalPath}, " +
-            "sourcePath=${metadata.sourcePath}, " +
-            "hasEssential=${metadata.hasEssentialMetadata()}"
+            "internalPath=${metadata.internalPath}"
         }
 
         // Launch async notification - don't block the upload pipeline
         scope.launch {
             try {
-                log.info { "!!!!HARSH's " +
-                    "Starting async notification for document: ${metadata.name} at ${metadata.internalPath}" 
-                }
                 apiClient.notifyDocumentUpload(metadata)
             } catch (e: Exception) {
                 log.error(e) { 
