@@ -42,6 +42,14 @@ data class DatasourceResponse(
 )
 
 /**
+ * Data class representing the auth token response from kaiya-unstructured-service.
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class AuthTokenResponse(
+    @JsonProperty("token") val token: String
+)
+
+/**
  * HTTP client for calling the middleware service to notify about uploaded documents.
  * This is a hard-coded integration point for Tellius middleware service.
  * 
@@ -72,6 +80,7 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
 
     companion object {
         private const val MIDDLEWARE_URL_BASE = "http://middleware-service:8082/unstructure"
+        private const val KAIYA_AUTH_TOKEN_URL = "http://kaiya-unstructured-service:8080/api/unstructured/internal-auth-token"
         
         // Hard-coded headers as per curl specification
         private const val HEADER_ACCEPT = "application/json, text/plain, */*"
@@ -88,7 +97,6 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
         private const val HEADER_SEC_CH_UA = "\"Not=A?Brand\";v=\"24\", \"Chromium\";v=\"140\""
         private const val HEADER_SEC_CH_UA_MOBILE = "?0"
         private const val HEADER_SEC_CH_UA_PLATFORM = "\"macOS\""
-        private const val HEADER_AUTHORIZATION = "uCamYLcggKFEzL6XCgTS"
         private const val HEADER_USERID = "TELLIUS_SUPERUSER_ID"
         private const val HEADER_CONTENT_TYPE = "application/json"
     }
@@ -174,11 +182,13 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
         log.info { "Fetching datasource owner for datasource ID: $datasourceId" }
         
         val url = "$MIDDLEWARE_URL_BASE/datasources/$datasourceId"
+        val authToken = fetchAuthorizationToken()
+        
         val request = HttpRequest.newBuilder()
             .uri(URI.create(url))
             .version(HttpClient.Version.HTTP_1_1)
             .header("Content-Type", HEADER_CONTENT_TYPE)
-            .header("Authorization", HEADER_AUTHORIZATION)
+            .header("Authorization", authToken)
             .header("USERID", HEADER_USERID)
             .GET()
             .timeout(Duration.ofSeconds(30))
@@ -197,6 +207,43 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
         cachedDatasourceId = datasourceResponse.id
         
         log.info { "Successfully fetched datasource owner - user ID: $cachedUserId, datasource ID: $cachedDatasourceId" }
+    }
+
+    /**
+     * Fetch the authorization token from kaiya-unstructured-service.
+     * This method is called each time we need to make a request to ensure we have the latest token.
+     * 
+     * @return The authorization token
+     * @throws RuntimeException if the token cannot be fetched
+     */
+    private fun fetchAuthorizationToken(): String {
+        log.info { "Fetching authorization token from kaiya service" }
+        
+        val request = HttpRequest.newBuilder()
+            .uri(URI.create(KAIYA_AUTH_TOKEN_URL))
+            .version(HttpClient.Version.HTTP_1_1)
+            .header("USERID", HEADER_USERID)
+            .GET()
+            .timeout(Duration.ofSeconds(30))
+            .build()
+        
+        return try {
+            val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
+            
+            if (response.statusCode() != 200) {
+                throw RuntimeException(
+                    "Failed to fetch auth token from kaiya service: HTTP ${response.statusCode()} - ${response.body()}"
+                )
+            }
+            
+            val tokenResponse = objectMapper.readValue(response.body(), AuthTokenResponse::class.java)
+            log.info { "Successfully fetched authorization token from kaiya service" }
+            
+            tokenResponse.token
+        } catch (e: Exception) {
+            log.error(e) { "Failed to fetch authorization token from kaiya service at $KAIYA_AUTH_TOKEN_URL" }
+            throw RuntimeException("Unable to fetch authorization token from kaiya service", e)
+        }
     }
 
     /**
@@ -313,16 +360,20 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
      * Build the HTTP request with only the essential headers.
      * Unnecessary browser headers can cause middleware crashes.
      * Uses the fetched user ID if available, otherwise falls back to TELLIUS_SUPERUSER_ID.
+     * Fetches the authorization token dynamically from kaiya service.
      */
     private fun buildRequest(payload: String): HttpRequest {
         val url = "$MIDDLEWARE_URL_BASE/documents"
         // Use cached user ID from datasource lookup if available, otherwise fall back to superuser
         val userIdHeader = cachedUserId ?: HEADER_USERID
         
+        // Fetch the authorization token dynamically each time
+        val authToken = fetchAuthorizationToken()
+        
         return HttpRequest.newBuilder()
             .uri(URI.create(url))
             .header("Content-Type", HEADER_CONTENT_TYPE)
-            .header("Authorization", HEADER_AUTHORIZATION)
+            .header("Authorization", authToken)
             .header("USERID", userIdHeader)
             .POST(HttpRequest.BodyPublishers.ofString(payload))
             .timeout(Duration.ofSeconds(30))
