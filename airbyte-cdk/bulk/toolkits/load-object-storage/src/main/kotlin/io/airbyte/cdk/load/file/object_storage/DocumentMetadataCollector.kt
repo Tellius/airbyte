@@ -20,7 +20,17 @@ data class DocumentMetadata(
     val sourcePath: String? = null,
     val docUpdatedAt: String? = null,
     val fileSizeBytes: Long = 0L,
-    val internalPath: String? = null
+    val internalPath: String? = null,
+    /** 
+     * The source file ID (e.g., Google Drive file ID).
+     * Available when using file transfer mode from sources like Google Drive.
+     */
+    val fileId: String? = null,
+    /**
+     * The full source URI/redirect link (e.g., https://drive.google.com/open?id=FILE_ID).
+     * Available when using file transfer mode from sources like Google Drive.
+     */
+    val sourceUri: String? = null
 ) {
     /**
      * Check if essential metadata has been collected.
@@ -116,25 +126,39 @@ object DocumentMetadataExtractor {
         val sourceFileUrl = dataNode.get("_ab_source_file_url")?.asText()
         val lastModified = dataNode.get("_ab_source_file_last_modified")?.asText()
         
-        // Determine name and type
-        val name = documentKey ?: sourceFileUrl
+        // File transfer mode fields (available from Google Drive, SharePoint, etc.)
+        // These contain the source file ID and full redirect URL
+        // In File Transfer Mode: "id" and "source_uri"
+        // In Parsing Mode with custom stream: "_ab_source_file_id" and "_ab_source_file_redirect_url"
+        val fileIdFromTransfer = dataNode.get("id")?.asText()
+        val fileIdFromParsing = dataNode.get("_ab_source_file_id")?.asText()
+        val fileId = fileIdFromTransfer ?: fileIdFromParsing
+        
+        val sourceUriFromTransfer = dataNode.get("source_uri")?.asText()
+        val sourceUriFromParsing = dataNode.get("_ab_source_file_redirect_url")?.asText()
+        val sourceUri = sourceUriFromTransfer ?: sourceUriFromParsing
+        
+        val fileName = dataNode.get("file_name")?.asText()
+        val updatedAt = dataNode.get("updated_at")?.asText()
+        
+        // Determine name (prefer file_name from file transfer mode, then document_key, then _ab_source_file_url)
+        val name = fileName ?: documentKey ?: sourceFileUrl
         val type = name?.let { extractFileExtension(it) }
         
-        // Extract source path (prefer _ab_source_file_url)
-        val sourcePath = sourceFileUrl ?: documentKey
+        // Extract source path (prefer _ab_source_file_url for backwards compatibility)
+        val sourcePath = sourceFileUrl ?: documentKey ?: fileName
         
-        val docUpdatedAt = lastModified?.let { parseAndFormatTimestamp(it) }
-        
-        log.debug { 
-            "File-based extraction: documentKey=$documentKey, sourceFileUrl=$sourceFileUrl"
-        }
+        // Use updated_at from file transfer mode if available, otherwise fall back to _ab_source_file_last_modified
+        val docUpdatedAt = (updatedAt ?: lastModified)?.let { parseAndFormatTimestamp(it) }
         
         return DocumentMetadata(
             name = name,
             type = type,
             sourcePath = sourcePath,
             docUpdatedAt = docUpdatedAt,
-            fileSizeBytes = recordSizeBytes
+            fileSizeBytes = recordSizeBytes,
+            fileId = fileId,
+            sourceUri = sourceUri
         )
     }
     

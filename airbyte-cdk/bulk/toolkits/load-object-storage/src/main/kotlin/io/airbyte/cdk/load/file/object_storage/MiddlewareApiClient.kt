@@ -137,9 +137,16 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
                 "fallback SUPERUSER"
             }
             
+            val sourceInfo = if (!metadata.fileId.isNullOrBlank()) {
+                "fileId=${metadata.fileId}, sourceUri=${metadata.sourceUri}"
+            } else {
+                "sourcePath=${metadata.sourcePath}"
+            }
+            
             log.info { 
                 "Sending document to middleware API:\n" +
                 "  Document: ${metadata.name}\n" +
+                "  Source: $sourceInfo\n" +
                 "  User: $userIdInfo\n" +
                 "  Method: ${request.method()}\n" +
                 "  URL: ${request.uri()}"
@@ -289,6 +296,16 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
         )
         metaDataObject.put("document_fingerprint", documentFingerprint)
         metaDataObject.put("airbyte_sync_timestamp", System.currentTimeMillis())
+        
+        // Add source file ID and redirect URI if available (from Google Drive, SharePoint, etc.)
+        // These enable creating redirect links back to the source file
+        if (!metadata.fileId.isNullOrBlank()) {
+            metaDataObject.put("source_file_id", metadata.fileId)
+        }
+        if (!metadata.sourceUri.isNullOrBlank()) {
+            metaDataObject.put("source_redirect_uri", metadata.sourceUri)
+        }
+        
         payload.set<ObjectNode>("meta_data", metaDataObject)
         
         return objectMapper.writeValueAsString(payload)

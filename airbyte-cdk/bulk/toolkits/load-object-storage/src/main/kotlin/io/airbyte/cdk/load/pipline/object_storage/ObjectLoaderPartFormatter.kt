@@ -153,15 +153,10 @@ class ObjectLoaderPartFormatter<T : OutputStream>(
         val metadata = DocumentMetadataExtractor.extractFromRecord(input, internalPath)
         
         if (metadata != null) {
-            log.info { "!!!!HARSH's " +
-                "Notifying middleware for document from stream ${state.stream.mappedDescriptor}: " +
-                "name=${metadata.name}, sourcePath=${metadata.sourcePath}, " +
-                "internalPath=${metadata.internalPath}, hasEssential=${metadata.hasEssentialMetadata()}"
-            }
             // Notify immediately for this document
             uploadNotifier.notifyUploadComplete(metadata)
         } else {
-            log.warn { "!!!!HARSH's Failed to extract metadata from record in stream ${state.stream.mappedDescriptor}" }
+            log.warn { "Failed to extract metadata from record in stream ${state.stream.mappedDescriptor}" }
         }
         
         state.writer.accept(input)
