@@ -290,10 +290,26 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
         
         // Add meta_data with deterministic UUID for tracking the source document
         // This fingerprint stays the same across syncs for the same source document
+        // Priority: fileId > sourcePath > name
+        // - fileId (Google Drive, SharePoint): Prevents collisions from duplicate filenames
+        // - sourcePath (S3, Azure Blob, Gong): Uses unique path as identifier
         val metaDataObject = objectMapper.createObjectNode()
-        val documentFingerprint = generateDeterministicUUID(
-            metadata.sourcePath ?: metadata.name ?: "unknown"
-        )
+        
+        // Determine which field to use for fingerprint generation
+        val (fingerprintInput, fieldUsed) = when {
+            metadata.fileId?.isNotBlank() == true -> Pair(metadata.fileId, "fileId")
+            metadata.sourcePath?.isNotBlank() == true -> Pair(metadata.sourcePath, "sourcePath")
+            metadata.name?.isNotBlank() == true -> Pair(metadata.name, "name")
+            else -> Pair("unknown", "fallback")
+        }
+        
+        val documentFingerprint = generateDeterministicUUID(fingerprintInput)
+        
+        log.info { 
+            "Generated document_fingerprint for '${metadata.name}': " +
+            "field_used=$fieldUsed, value='$fingerprintInput', fingerprint=$documentFingerprint"
+        }
+        
         metaDataObject.put("document_fingerprint", documentFingerprint)
         metaDataObject.put("airbyte_sync_timestamp", System.currentTimeMillis())
         
@@ -316,11 +332,16 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
      * Same source document will always generate the same fingerprint UUID across syncs.
      * This allows the middleware to track the same source document over multiple sync runs.
      * 
-     * @param sourcePath The source path/identifier of the document (e.g., "water.pdf")
+     * The input string is prioritized as follows:
+     * - fileId (Google Drive, SharePoint): Prevents collisions from duplicate filenames
+     * - sourcePath (S3, Azure Blob, Gong): Uses unique file path as identifier
+     * - name: Fallback when neither fileId nor sourcePath is available
+     * 
+     * @param sourcePath The source identifier (fileId, path, or name) of the document
      * @return A deterministic UUID string that serves as the document fingerprint
      */
     private fun generateDeterministicUUID(sourcePath: String): String {
-        // Generate MD5 hash of the source path
+        // Generate MD5 hash of the source identifier
         val md5 = MessageDigest.getInstance("MD5")
         val hash = md5.digest(sourcePath.toByteArray(StandardCharsets.UTF_8))
         
