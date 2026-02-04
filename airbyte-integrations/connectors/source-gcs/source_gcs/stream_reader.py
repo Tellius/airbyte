@@ -24,6 +24,87 @@ from source_gcs.zip_helper import ZipHelper
 # google can raise warnings for end user credentials, wrapping it to Logger
 logging.captureWarnings(True)
 
+
+class NamedFileWrapper(IOBase):
+    """
+    A wrapper around a file-like object that adds a .name attribute.
+    
+    This is needed because smart_open's SeekableBufferedInputBase doesn't properly
+    support setting the .name attribute, and the unstructured library's detect_filetype()
+    function requires file.name to be a string path to determine the file extension.
+    
+    Without this wrapper, detect_filetype() fails with:
+    TypeError: expected str, bytes or os.PathLike object, not NoneType
+    
+    Note: The name property also has a setter because the CDK's unstructured_parser.py
+    sometimes sets file.name = None (e.g., in _get_filetype method).
+    """
+    
+    def __init__(self, file_handle: IOBase, name: str):
+        self._file_handle = file_handle
+        self._name = name
+    
+    @property
+    def name(self) -> str:
+        return self._name
+    
+    @name.setter
+    def name(self, value):
+        # IMPORTANT: Ignore attempts to set name to None.
+        # The CDK's unstructured_parser.py may try to set file.name = None,
+        # but we need to preserve the original filename for detect_filetype() to work.
+        # If we allow None, we're back to the original error:
+        # TypeError: expected str, bytes or os.PathLike object, not NoneType
+        if value is not None:
+            self._name = value
+        # If value is None, we silently ignore it and keep the original name
+    
+    def read(self, size: int = -1):
+        return self._file_handle.read(size)
+    
+    def readline(self, size: int = -1):
+        return self._file_handle.readline(size)
+    
+    def readlines(self, hint: int = -1):
+        return self._file_handle.readlines(hint)
+    
+    def write(self, s):
+        return self._file_handle.write(s)
+    
+    def seek(self, offset: int, whence: int = 0):
+        return self._file_handle.seek(offset, whence)
+    
+    def tell(self):
+        return self._file_handle.tell()
+    
+    def close(self):
+        return self._file_handle.close()
+    
+    def flush(self):
+        return self._file_handle.flush()
+    
+    def readable(self):
+        return self._file_handle.readable() if hasattr(self._file_handle, 'readable') else True
+    
+    def writable(self):
+        return self._file_handle.writable() if hasattr(self._file_handle, 'writable') else False
+    
+    def seekable(self):
+        return self._file_handle.seekable() if hasattr(self._file_handle, 'seekable') else False
+    
+    def __iter__(self):
+        return iter(self._file_handle)
+    
+    def __next__(self):
+        return next(self._file_handle)
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
 ERROR_MESSAGE_ACCESS = (
     "We don't have access to {uri}. The file appears to have become unreachable during sync."
     "Check whether key {uri} exists in `{bucket}` bucket and/or has proper ACL permissions"
@@ -98,13 +179,26 @@ class SourceGCSStreamReader(AbstractFileBasedStreamReader):
                     last_modified = blob.updated.astimezone(pytz.utc).replace(tzinfo=None)
 
                     if not start_date or last_modified >= start_date:
+                        # STABLE identifier - always gs:// path (for fingerprint generation)
+                        # This stays the same across syncs, unlike signed URLs
+                        stable_id = f"gs://{blob.bucket.name}/{blob.name}"
+                        
                         if self.config.credentials.auth_type == "Client":
-                            uri = f"gs://{blob.bucket.name}/{blob.name}"
+                            # OAuth: gs:// path can be used directly for download
+                            download_url = stable_id
                         else:
-                            uri = blob.generate_signed_url(expiration=timedelta(days=7), version="v4")
+                            # Service Account: need signed URL for download access
+                            download_url = blob.generate_signed_url(expiration=timedelta(days=7), version="v4")
 
                         file_extension = ".".join(blob.name.split(".")[1:])
-                        remote_file = GCSRemoteFile(uri=uri, last_modified=last_modified, mime_type=file_extension)
+                        
+                        remote_file = GCSRemoteFile(
+                            uri=download_url,           # For open_file() compatibility
+                            last_modified=last_modified,
+                            mime_type=file_extension,
+                            id=stable_id,               # Stable identifier for fingerprinting
+                            download_url=download_url   # URL for downloading the file
+                        )
 
                         if file_extension == "zip":
                             yield from ZipHelper(blob, remote_file, self.tmp_dir).get_gcs_remote_files()
@@ -122,11 +216,29 @@ class SourceGCSStreamReader(AbstractFileBasedStreamReader):
             prefix=prefix,
         ) from exc
 
+    def _extract_filename_from_uri(self, uri: str) -> str:
+        """
+        Extract the filename from a URI.
+        Handles both gs:// URIs and signed HTTPS URLs.
+        
+        Examples:
+            gs://bucket/path/to/file.pdf -> file.pdf
+            https://storage.googleapis.com/.../file.pdf?X-Goog-Signature=... -> file.pdf
+        """
+        if uri.startswith("gs://"):
+            # gs://bucket/path/to/file.pdf -> file.pdf
+            return uri.split("/")[-1]
+        else:
+            # Signed URL: https://.../.../file.pdf?X-Goog-Signature=...
+            # Extract the path part before query params, then get the filename
+            path_part = uri.split("?")[0]
+            return path_part.split("/")[-1]
+
     def open_file(self, file: GCSRemoteFile, mode: FileReadMode, encoding: Optional[str], logger: logging.Logger) -> IOBase:
         """
         Open and yield a remote file from GCS for reading.
         """
-        logger.debug(f"Trying to open {file.uri}")
+        logger.debug(f"Opening file: {file.uri}")
 
         # choose correct compression mode
         file_extension = file.mime_type.split(".")[-1]
@@ -141,6 +253,22 @@ class SourceGCSStreamReader(AbstractFileBasedStreamReader):
             )
             if not result.seekable():
                 result = StringIO(result.read())
+            
+            # FIX: Wrap the file handle in NamedFileWrapper to ensure .name attribute is available.
+            # The unstructured library's detect_filetype() function calls os.path.splitext(file.name)
+            # to determine the file extension. smart_open's SeekableBufferedInputBase doesn't properly
+            # support setting .name, so we wrap it in our custom class that exposes .name correctly.
+            # Without this fix, detect_filetype() fails with:
+            # TypeError: expected str, bytes or os.PathLike object, not NoneType
+            filename = self._extract_filename_from_uri(file.uri)
+            
+            # URL decode the filename to handle %20 -> space, etc.
+            from urllib.parse import unquote
+            filename = unquote(filename)
+            
+            # Wrap the result in NamedFileWrapper to ensure .name is properly exposed
+            result = NamedFileWrapper(result, filename)
+            
         except OSError as oe:
             logger.warning(ERROR_MESSAGE_ACCESS.format(uri=file.uri, bucket=self.config.bucket))
             logger.exception(oe)

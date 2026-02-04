@@ -46,8 +46,17 @@ def get_stream_name(blob):
 
 class GCSRemoteFile(RemoteFile):
     """
-    Extends RemoteFile instance with displayed_uri attribute.
-    displayed_uri is being used by Cursor to identify files with temporal local path in their uri attribute.
+    Extends RemoteFile instance with GCS-specific attributes.
+    
+    Attributes:
+        displayed_uri: Used by Cursor to identify files with temporal local path in their uri attribute.
+        id: Stable identifier for the file (always gs://bucket/path/file.ext format).
+            Used for fingerprint generation - stays the same across syncs.
+        download_url: URL that can be used to download the file.
+            - For OAuth: Same as id (gs:// path)
+            - For Service Account: Signed URL with expiration
     """
 
     displayed_uri: str = None
+    id: str = None
+    download_url: str = None
