@@ -1,0 +1,26 @@
+# Tellius custom Python connector base image
+#
+# Extends the standard Airbyte python-connector-base with the tellius-ocr-parser
+# package, which auto-patches the CDK's default_parsers at Python startup via
+# a .pth file. This replaces UnstructuredParser with CustomOCRParser for all
+# connectors built on this base — no connector code changes required.
+#
+# Build:
+#   cd docker-images
+#   docker build -f Dockerfile.python-connector-base-tellius -t tellius/python-connector-base:4.0.2 .
+#
+# Then build a connector on top:
+#   cd ../airbyte-integrations/connectors/source-gcs
+#   docker build -f ../../../docker-images/Dockerfile.python-connector \
+#     --build-arg BASE_IMAGE=tellius/python-connector-base:4.0.2 \
+#     --build-arg CONNECTOR_NAME=source-gcs \
+#     -t <your-registry>/airbyte:source-gcs-tellius-poc .
+
+FROM docker.io/airbyte/python-connector-base:4.0.2@sha256:9fdb1888c4264cf6fee473649ecb593f56f58e5d0096a87ee0b231777e2e3e73
+
+COPY tellius-ocr-parser /tmp/tellius-ocr-parser
+
+RUN pip install --no-cache-dir /tmp/tellius-ocr-parser && \
+    echo "import tellius_ocr_parser" > \
+      $(python -c "import site; print(site.getsitepackages()[0])")/tellius_ocr_parser.pth && \
+    rm -rf /tmp/tellius-ocr-parser
