@@ -7,10 +7,7 @@ name = "tellius-ocr-parser"
 version = "0.1.0"
 description = "Tellius custom OCR parser for Airbyte file-based sources"
 requires-python = ">=3.10"
-dependencies = [
-    "python-docx",
-    "python-pptx",
-]
+dependencies = []
 
 [tool.setuptools.packages.find]
 include = ["tellius_ocr_parser*"]

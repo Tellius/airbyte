@@ -12,8 +12,8 @@ Config flow:
   3. If use_mistral_ocr=true and mistral_api_key is non-empty → use Mistral OCR
   4. Otherwise delegate to UnstructuredParser
 
-Uses python-docx (DOCX) and python-pptx (PPTX) for Office formats when
-Mistral is active. When falling back, UnstructuredParser handles everything.
+All document formats (PDF, DOCX, PPTX) are sent to Mistral OCR when active.
+When falling back, UnstructuredParser handles everything.
 
 Replaces the default UnstructuredParser via .pth auto-patch while maintaining
 the same output schema so downstream consumers (DocumentMetadataCollector,
@@ -24,7 +24,7 @@ import base64
 import logging
 import os
 import time
-from io import BytesIO, IOBase
+from io import IOBase
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 from urllib.parse import urlparse, unquote
 
@@ -40,6 +40,12 @@ from airbyte_cdk.sources.file_based.remote_file import RemoteFile
 from airbyte_cdk.sources.file_based.schema_helpers import SchemaType
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".md", ".txt"}
+
+MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
 
 MIDDLEWARE_URL = os.environ.get(
     "TELLIUS_MIDDLEWARE_URL",
@@ -66,14 +72,18 @@ def _extract_format(config: FileBasedStreamConfig) -> UnstructuredFormat:
     return config.format
 
 
-def _extract_pdf_text_mistral(file_bytes: bytes, api_key: str) -> str:
-    """Extract text from PDF using Mistral OCR REST API."""
+def _extract_text_mistral(file_bytes: bytes, api_key: str, mime_type: str) -> str:
+    """Extract text from a document using Mistral OCR REST API.
+
+    Supports PDF, DOCX, and PPTX via the document_url data URI with the
+    appropriate MIME type.
+    """
     import requests as _requests
 
     start_time = time.time()
 
-    encoded_pdf = base64.standard_b64encode(file_bytes).decode("utf-8")
-    data_uri = f"data:application/pdf;base64,{encoded_pdf}"
+    encoded = base64.standard_b64encode(file_bytes).decode("utf-8")
+    data_uri = f"data:{mime_type};base64,{encoded}"
 
     response = _requests.post(
         "https://api.mistral.ai/v1/ocr",
@@ -103,36 +113,10 @@ def _extract_pdf_text_mistral(file_bytes: bytes, api_key: str) -> str:
     total_chars = sum(len(p) for p in pages_text)
     logger.info(
         f"Mistral OCR: {len(result.get('pages', []))} pages, "
-        f"{elapsed:.2f}s, {total_chars} chars extracted"
+        f"{elapsed:.2f}s, {total_chars} chars, mime_type={mime_type}"
     )
 
     return "\n\n".join(pages_text)
-
-
-def _extract_docx_text(file_bytes: bytes) -> str:
-    from docx import Document
-
-    doc = Document(BytesIO(file_bytes))
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-    return "\n\n".join(paragraphs)
-
-
-def _extract_pptx_text(file_bytes: bytes) -> str:
-    from pptx import Presentation
-
-    prs = Presentation(BytesIO(file_bytes))
-    slides_text = []
-    for slide in prs.slides:
-        parts = []
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                for paragraph in shape.text_frame.paragraphs:
-                    text = paragraph.text.strip()
-                    if text:
-                        parts.append(text)
-        if parts:
-            slides_text.append("\n".join(parts))
-    return "\n\n".join(slides_text)
 
 
 class CustomOCRParser(FileTypeParser):
@@ -267,14 +251,12 @@ class CustomOCRParser(FileTypeParser):
         discovered_schema: Optional[Mapping[str, SchemaType]],
     ) -> Iterable[Dict[str, Any]]:
         if not self._should_use_mistral(logger):
-            logger.info(f"Delegating to UnstructuredParser for: {file.uri}")
             yield from self._get_fallback_parser().parse_records(
                 config, file, stream_reader, logger, discovered_schema
             )
             return
 
         format_config = _extract_format(config)
-        logger.info(f"Tellius CustomOCRParser (Mistral) processing: {file.uri}")
 
         with stream_reader.open_file(file, self.file_read_mode, None, logger) as file_handle:
             try:
@@ -327,12 +309,8 @@ class CustomOCRParser(FileTypeParser):
             file_bytes = file_bytes.encode("utf-8")
         file_handle.seek(0)
 
-        if extension == ".pdf":
-            return _extract_pdf_text_mistral(file_bytes, self._mistral_api_key)
-        elif extension == ".docx":
-            return _extract_docx_text(file_bytes)
-        elif extension == ".pptx":
-            return _extract_pptx_text(file_bytes)
+        if extension in MIME_TYPES:
+            return _extract_text_mistral(file_bytes, self._mistral_api_key, MIME_TYPES[extension])
         else:
             raise RecordParseError(
                 FileBasedSourceError.ERROR_PARSING_RECORD,
