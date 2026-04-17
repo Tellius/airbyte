@@ -22,6 +22,7 @@ This document is the **single source of truth** for all custom Airbyte connector
 | **GCS** | `source-gcs-tellius-release-1.8.0-v3` | 2026-04-13 | `python-connector-base-tellius-release-v2` |
 | **Azure Blob Storage** | `source-azure-blob-tellius-release-1.8.0-v2` | 2026-04-13 | `python-connector-base-tellius-release-v2` |
 | **S3** | `source-s3-tellius-release-1.8.0-v2` | 2026-04-13 | `python-connector-base-tellius-release-v2` |
+| **SharePoint** | `source-sharepoint-tellius-release-1.8.0-v1` | 2026-03-31 | `python-connector-base-tellius-release-v2` |
 
 ---
 
@@ -36,7 +37,8 @@ python-connector-base-tellius-release-v2               (Custom base: tellius-ocr
          ├──▶ source-gDrive-tellius-release-1.8.0-v3
          ├──▶ source-gcs-tellius-release-1.8.0-v3
          ├──▶ source-azure-blob-tellius-release-1.8.0-v2
-         └──▶ source-s3-tellius-release-1.8.0-v2
+         ├──▶ source-s3-tellius-release-1.8.0-v2
+         └──▶ source-sharepoint-tellius-release-1.8.0-v1
 ```
 
 ---
@@ -99,6 +101,12 @@ The custom base image extends Airbyte's official `python-connector-base` with:
 |-----|------|---------|
 | `source-s3-tellius-release-1.8.0-v1` | 2026-04-08 | Initial production release on `python-connector-base-tellius-release-v1`. |
 | `source-s3-tellius-release-1.8.0-v2` | 2026-04-13 | Rebuilt on `python-connector-base-tellius-release-v2`. Adds native DOCX/PPTX Mistral OCR support. |
+
+### SharePoint (`source-sharepoint-tellius-release-*`)
+
+| Tag | Date | Changes |
+|-----|------|---------|
+| `source-sharepoint-tellius-release-1.8.0-v1` | 2026-03-31 | Initial production release on `python-connector-base-tellius-release-v2`. Full Mistral OCR support for PDF, DOCX, PPTX. Connector version: `source-microsoft-sharepoint 0.10.3`. |
 
 ---
 
@@ -164,6 +172,7 @@ The custom base image extends Airbyte's official `python-connector-base` with:
 | GCS | `source-gcs` | `source-gcs` |
 | Azure Blob Storage | `source-azure-blob-storage` | `source-azure-blob-storage` |
 | S3 | `source-s3` | `source-s3` |
+| SharePoint | `source-microsoft-sharepoint` | `source-microsoft-sharepoint` |
 
 ---
 
