@@ -33,6 +33,7 @@ from .exceptions import ErrorFetchingMetadata
 from .utils import (
     FolderNotFoundException,
     MicrosoftSharePointRemoteFile,
+    _extract_user_identity,
     execute_query_with_retry,
     filter_http_urls,
     get_site_prefix,
@@ -110,6 +111,15 @@ class SourceMicrosoftSharePointStreamReader(AbstractFileBasedStreamReader):
     ROOT_PATH = [".", "/"]
     FILE_SIZE_LIMIT = 1_500_000_000
 
+    @staticmethod
+    def _derive_site_name(web_url: str) -> Optional[str]:
+        """Extract site name from a SharePoint web URL.
+        e.g. https://contoso.sharepoint.com/sites/MySite/... → 'MySite'
+        Returns None for root-level sites that have no /sites/ segment.
+        """
+        match = re.search(r"/sites/([^/]+)", web_url)
+        return match.group(1) if match else None
+
     def __init__(self):
         super().__init__()
         self._auth_client = None
@@ -185,6 +195,31 @@ class SourceMicrosoftSharePointStreamReader(AbstractFileBasedStreamReader):
         headers = {"Authorization": f"Bearer {access_token}"}
         base_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}"
 
+        def _build_remote_file(item_data: dict, file_path: str) -> MicrosoftSharePointRemoteFile:
+            """Construct a MicrosoftSharePointRemoteFile from a raw Graph API item dict."""
+            last_modified = datetime.strptime(item_data["lastModifiedDateTime"], "%Y-%m-%dT%H:%M:%SZ")
+            created_at = datetime.strptime(item_data["createdDateTime"], "%Y-%m-%dT%H:%M:%SZ")
+            created_by = item_data.get("createdBy", {}).get("user", {})
+            last_mod_by = item_data.get("lastModifiedBy", {}).get("user", {})
+            site_name = self._derive_site_name(file_path)
+            # prefix_path: everything between the library root and the filename
+            prefix_path = "/".join(file_path.split("/")[:-1])
+            return MicrosoftSharePointRemoteFile(
+                uri=file_path,
+                download_url=item_data["@microsoft.graph.downloadUrl"],
+                last_modified=last_modified,
+                created_at=created_at,
+                content_type=item_data.get("file", {}).get("mimeType"),
+                size=item_data.get("size"),
+                author=_extract_user_identity(created_by),
+                last_modified_by=_extract_user_identity(last_mod_by),
+                site_name=site_name,
+                library_name=None,   # not available without an extra drive API call for shared items
+                prefix_path=prefix_path,
+                item_id=item_data.get("id"),
+                drive_id=item_data.get("parentReference", {}).get("driveId"),
+            )
+
         def get_files(url: str, path: str) -> Iterable[MicrosoftSharePointRemoteFile]:
             response = requests.get(url, headers=headers)
             if response.status_code != 200:
@@ -195,12 +230,7 @@ class SourceMicrosoftSharePointStreamReader(AbstractFileBasedStreamReader):
             for child in data.get("value", []):
                 new_path = path + "/" + child["name"]
                 if child.get("file"):  # Object is a file
-                    # last_modified and created_at are type string e.g. "2025-04-16T14:41:00Z"
-                    last_modified = datetime.strptime(child["lastModifiedDateTime"], "%Y-%m-%dT%H:%M:%SZ")
-                    created_at = datetime.strptime(child["createdDateTime"], "%Y-%m-%dT%H:%M:%SZ")
-                    yield MicrosoftSharePointRemoteFile(
-                        uri=new_path, download_url=child["@microsoft.graph.downloadUrl"], last_modified=last_modified, created_at=created_at
-                    )
+                    yield _build_remote_file(child, new_path)
                 else:  # Object is a folder, retrieve children
                     child_url = f"{base_url}/items/{child['id']}/children"  # Use item endpoint for nested objects
                     yield from get_files(child_url, new_path)
@@ -220,30 +250,67 @@ class SourceMicrosoftSharePointStreamReader(AbstractFileBasedStreamReader):
         item_data = item_response.json()
         if item_data.get("file"):  # Initial object is a file
             new_path = path + "/" + item_data["name"]
-            last_modified = datetime.strptime(item_data["lastModifiedDateTime"], "%Y-%m-%dT%H:%M:%SZ")
-            created_at = datetime.strptime(item_data["createdDateTime"], "%Y-%m-%dT%H:%M:%SZ")
-            yield MicrosoftSharePointRemoteFile(
-                uri=new_path, download_url=item_data["@microsoft.graph.downloadUrl"], last_modified=last_modified, created_at=created_at
-            )
+            yield _build_remote_file(item_data, new_path)
         else:
             # Initial object is a folder, start file retrieval
             yield from get_files(f"{item_url}/children", path)
 
-    def _list_directories_and_files(self, root_folder, path) -> Iterable[MicrosoftSharePointRemoteFile]:
+    def _list_directories_and_files(
+        self,
+        root_folder,
+        path,
+        library_name: Optional[str] = None,
+        site_name: Optional[str] = None,
+        library_root_url: Optional[str] = None,
+    ) -> Iterable[MicrosoftSharePointRemoteFile]:
         """Enumerates folders and files starting from a root folder."""
         drive_items = execute_query_with_retry(root_folder.children.get())
         for item in drive_items:
             item_path = path + "/" + item.name if path else item.name
             if item.is_file:
                 # last_modified and created_at are type datetime.datetime e.g. (2025, 2, 18, 19, 32, 4)
+                props = item.properties
+                # props["createdBy"] / props["lastModifiedBy"] are office365 SDK IdentitySet
+                # objects, not plain dicts — pass them directly to _extract_user_identity
+                # which handles both SDK objects and raw dicts.
+                author = _extract_user_identity(props.get("createdBy"))
+                last_modified_by = _extract_user_identity(props.get("lastModifiedBy"))
+                # props["file"] may be an SDK File object rather than a plain dict
+                file_prop = props.get("file")
+                if isinstance(file_prop, dict):
+                    content_type = file_prop.get("mimeType")
+                elif file_prop is not None:
+                    content_type = getattr(file_prop, "mime_type", None) or getattr(file_prop, "mimeType", None)
+                else:
+                    content_type = None
+                # parentReference may also be an SDK object
+                parent_ref = props.get("parentReference")
+                if isinstance(parent_ref, dict):
+                    drive_id = parent_ref.get("driveId")
+                elif parent_ref is not None:
+                    drive_id = getattr(parent_ref, "drive_id", None) or getattr(parent_ref, "driveId", None)
+                else:
+                    drive_id = None
+                # prefix_path: item_path relative to the library root URL, filename stripped
+                relative = item_path[len(library_root_url):].lstrip("/") if library_root_url else item_path
+                prefix_path = "/".join(relative.split("/")[:-1])
                 yield MicrosoftSharePointRemoteFile(
                     uri=item_path,
-                    download_url=item.properties["@microsoft.graph.downloadUrl"],
-                    last_modified=item.properties["lastModifiedDateTime"],
-                    created_at=item.properties["createdDateTime"],
+                    download_url=props["@microsoft.graph.downloadUrl"],
+                    last_modified=props["lastModifiedDateTime"],
+                    created_at=props["createdDateTime"],
+                    content_type=content_type,
+                    size=props.get("size"),
+                    author=author,
+                    last_modified_by=last_modified_by,
+                    site_name=site_name,
+                    library_name=library_name,
+                    prefix_path=prefix_path,
+                    item_id=props.get("id"),
+                    drive_id=drive_id,
                 )
             else:
-                yield from self._list_directories_and_files(item, item_path)
+                yield from self._list_directories_and_files(item, item_path, library_name, site_name, library_root_url)
         yield from []
 
     def _get_files_by_drive_name(self, drives, folder_path) -> Iterable[MicrosoftSharePointRemoteFile]:
@@ -254,6 +321,9 @@ class SourceMicrosoftSharePointStreamReader(AbstractFileBasedStreamReader):
         for drive in drives:
             is_sharepoint = drive.drive_type == "documentLibrary"
             if is_sharepoint:
+                library_name = drive.name
+                site_name = self._derive_site_name(drive.web_url)
+
                 # Define base path for drive files to differentiate files between drives
                 if folder_path in self.ROOT_PATH:
                     folder = drive.root
@@ -265,7 +335,8 @@ class SourceMicrosoftSharePointStreamReader(AbstractFileBasedStreamReader):
                         continue
                     folder_path_url = drive.web_url + "/" + folder_path
 
-                yield from self._list_directories_and_files(folder, folder_path_url)
+                library_root_url = folder_path_url
+                yield from self._list_directories_and_files(folder, folder_path_url, library_name, site_name, library_root_url)
 
     def get_all_sites(self) -> List[MutableMapping[str, Any]]:
         """

@@ -2,7 +2,9 @@
 # Copyright (c) 2023 Airbyte, Inc., all rights reserved.
 #
 
+import io
 import logging
+import mimetypes
 import time
 from datetime import datetime
 from io import IOBase
@@ -29,10 +31,37 @@ from airbyte_cdk.sources.file_based.file_based_stream_reader import AbstractFile
 from airbyte_cdk.sources.file_based.file_record_data import FileRecordData
 from airbyte_cdk.sources.file_based.remote_file import RemoteFile
 from source_s3.v4.config import Config
+from source_s3.v4.remote_file import S3RemoteFile
 from source_s3.v4.zip_reader import DecompressedStream, RemoteFileInsideArchive, ZipContentReader, ZipFileHandler
 
 
 AWS_EXTERNAL_ID = getenv("AWS_ASSUME_ROLE_EXTERNAL_ID")
+
+
+class _S3BodyWrapper(io.RawIOBase):
+    """
+    Wraps a botocore StreamingBody as a proper io.RawIOBase so CDK parsers
+    can use it like any other file object.
+
+    botocore.response.StreamingBody has .read() but is not an IOBase subclass,
+    so parsers that do isinstance(f, IOBase) checks or call .readinto() would fail
+    without this wrapper.
+    """
+
+    def __init__(self, streaming_body):
+        self._body = streaming_body
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, n: int = -1) -> bytes:
+        return self._body.read() if n == -1 else self._body.read(n)
+
+    def readinto(self, b) -> int:
+        data = self._body.read(len(b))
+        n = len(data)
+        b[:n] = data
+        return n
 
 
 class SourceS3StreamReader(AbstractFileBasedStreamReader):
@@ -188,12 +217,57 @@ class SourceS3StreamReader(AbstractFileBasedStreamReader):
             raise exc
 
         logger.debug(f"try to open {file.uri}")
+
         try:
             s3_uri = self._construct_s3_uri(file)
             if isinstance(file, RemoteFileInsideArchive):
+                # Zip files need smart_open for the special decompression handling.
                 s3_file_object = smart_open.open(s3_uri, transport_params=params, mode="rb")
                 decompressed_stream = DecompressedStream(s3_file_object, file)
                 result = ZipContentReader(decompressed_stream, encoding)
+            elif isinstance(file, S3RemoteFile):
+                # For regular S3 files we call get_object() directly so we can read
+                # ContentType and user metadata from the same response that delivers
+                # the body — eliminating the separate head_object() call entirely.
+                file_key = file.uri
+                try:
+                    get_response = self.s3_client.get_object(Bucket=self.config.bucket, Key=file_key)
+
+                    # Reuse response headers for metadata — zero extra API calls.
+                    content_type_from_s3 = get_response.get("ContentType")
+                    if content_type_from_s3:
+                        file.content_type = content_type_from_s3
+                    file.user_metadata = get_response.get("Metadata") or None
+
+                    logger.debug(
+                        f"[S3] get_object enrichment for {file_key!r} — "
+                        f"content_type={file.content_type}, "
+                        f"user_metadata_keys={list(file.user_metadata.keys()) if file.user_metadata else []}"
+                    )
+
+                    # Wrap the streaming body as a proper IOBase for CDK parsers.
+                    raw = _S3BodyWrapper(get_response["Body"])
+                    if mode == FileReadMode.READ_BINARY:
+                        result = io.BufferedReader(raw)
+                    else:
+                        result = io.TextIOWrapper(io.BufferedReader(raw), encoding=encoding or "utf-8")
+
+                except OSError:
+                    logger.warning(
+                        f"We don't have access to {file.uri}. The file appears to have become unreachable during sync."
+                        f"Check whether key {file.uri} exists in `{self.config.bucket}` bucket and/or has proper ACL permissions"
+                    )
+
+                # Fetch object tags — still requires a separate API call (not available via get_object).
+                try:
+                    tags_response = self.s3_client.get_object_tagging(Bucket=self.config.bucket, Key=file_key)
+                    tag_set = tags_response.get("TagSet", [])
+                    file.object_tags = tag_set if tag_set else None
+                    logger.debug(
+                        f"[S3] get_object_tagging for {file_key!r} — tags_count={len(tag_set)}"
+                    )
+                except Exception as exc:
+                    logger.warning(f"[S3] Failed to fetch object tags for {file_key!r}: {exc}")
             else:
                 result = smart_open.open(s3_uri, transport_params=params, mode=mode.value, encoding=encoding)
         except OSError:
@@ -366,7 +440,35 @@ class SourceS3StreamReader(AbstractFileBasedStreamReader):
             yield remote_file
 
     def _handle_regular_file(self, file):
-        remote_file = RemoteFile(uri=file["Key"], last_modified=file["LastModified"].astimezone(pytz.utc).replace(tzinfo=None))
+        key = file["Key"]
+        last_modified = file["LastModified"].astimezone(pytz.utc).replace(tzinfo=None)
+        size = file.get("Size")
+        storage_class = file.get("StorageClass")
+
+        # Derive content type from the file extension — avoids head_object() per file during listing.
+        # mimetypes.guess_type returns (type, encoding), e.g. ("application/pdf", None).
+        guessed_type, _ = mimetypes.guess_type(key)
+
+        # Derive prefix path from the key — everything before the last "/"
+        # e.g. "Pharma/Sales/Q1/report.pdf" → "Pharma/Sales/Q1"
+        key_parts = key.split("/")
+        prefix_path = "/".join(key_parts[:-1])
+
+        remote_file = S3RemoteFile(
+            uri=key,
+            last_modified=last_modified,
+            size=size,
+            storage_class=storage_class,
+            content_type=guessed_type,
+            prefix_path=prefix_path,
+        )
+
+        logging.getLogger("airbyte").info(
+            f"[S3] Metadata captured for {key!r} — "
+            f"size={size}, storage_class={storage_class}, content_type={guessed_type}, "
+            f"prefix_path={prefix_path!r}"
+        )
+
         return remote_file
 
 

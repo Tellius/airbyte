@@ -30,7 +30,42 @@ data class DocumentMetadata(
      * The full source URI/redirect link (e.g., https://drive.google.com/open?id=FILE_ID).
      * Available when using file transfer mode from sources like Google Drive.
      */
-    val sourceUri: String? = null
+    val sourceUri: String? = null,
+    /** MIME type of the file (all sources: _ab_source_file_content_type). */
+    val contentType: String? = null,
+    /** File creation timestamp (GDrive, GCS, Azure: _ab_source_file_created_at). */
+    val createdAt: String? = null,
+    /** File owner email/name (GDrive: _ab_source_file_owner). */
+    val owner: String? = null,
+    /** User who last modified the file (GDrive: _ab_source_file_last_modified_by). */
+    val lastModifiedBy: String? = null,
+    /** Whether the file is shared (GDrive: _ab_source_file_shared). */
+    val shared: Boolean? = null,
+    /**
+     * Actual file size in bytes from the source system (_ab_source_file_size).
+     * Preferred over fileSizeBytes (which is the serialized record size).
+     */
+    val fileSizeFromSource: Long? = null,
+    /** Storage class (S3, GCS: _ab_source_file_storage_class). */
+    val storageClass: String? = null,
+    /** Azure access tier (Azure: _ab_source_file_access_tier). */
+    val accessTier: String? = null,
+    /** Virtual folder/prefix path (all sources: _ab_source_file_prefix_path). */
+    val prefixPath: String? = null,
+    /** S3 user-defined metadata, serialized as JSON string (_ab_source_file_user_metadata). */
+    val userMetadata: String? = null,
+    /** S3 object tags, serialized as JSON string (_ab_source_file_object_tags). */
+    val objectTags: String? = null,
+    /** Azure blob metadata, serialized as JSON string (_ab_source_file_blob_metadata). */
+    val blobMetadata: String? = null,
+    /** Azure container metadata, serialized as JSON string (_ab_source_file_container_metadata). */
+    val containerMetadata: String? = null,
+    /** GCS custom metadata, serialized as JSON string (_ab_source_file_custom_metadata). */
+    val customMetadata: String? = null,
+    /** SharePoint site name (_ab_source_file_site_name). */
+    val siteName: String? = null,
+    /** SharePoint document library name (_ab_source_file_library_name). */
+    val libraryName: String? = null,
 ) {
     /**
      * Check if essential metadata has been collected.
@@ -119,46 +154,94 @@ object DocumentMetadataExtractor {
     }
     
     /**
-     * Extract metadata from file-based sources (Google Drive, S3, etc.).
+     * Extract metadata from file-based sources (Google Drive, S3, GCS, Azure, etc.).
      */
     private fun extractFromFileSource(dataNode: JsonNode, recordSizeBytes: Long): DocumentMetadata {
         val documentKey = dataNode.get("document_key")?.asText()
         val sourceFileUrl = dataNode.get("_ab_source_file_url")?.asText()
         val lastModified = dataNode.get("_ab_source_file_last_modified")?.asText()
-        
+
         // File transfer mode fields (available from Google Drive, SharePoint, etc.)
-        // These contain the source file ID and full redirect URL
         // In File Transfer Mode: "id" and "source_uri"
         // In Parsing Mode with custom stream: "_ab_source_file_id" and "_ab_source_file_redirect_url"
         val fileIdFromTransfer = dataNode.get("id")?.asText()
         val fileIdFromParsing = dataNode.get("_ab_source_file_id")?.asText()
         val fileId = fileIdFromTransfer ?: fileIdFromParsing
-        
+
         val sourceUriFromTransfer = dataNode.get("source_uri")?.asText()
         val sourceUriFromParsing = dataNode.get("_ab_source_file_redirect_url")?.asText()
         val sourceUri = sourceUriFromTransfer ?: sourceUriFromParsing
-        
+
         val fileName = dataNode.get("file_name")?.asText()
         val updatedAt = dataNode.get("updated_at")?.asText()
-        
+
         // Determine name (prefer file_name from file transfer mode, then document_key, then _ab_source_file_url)
         val name = fileName ?: documentKey ?: sourceFileUrl
         val type = name?.let { extractFileExtension(it) }
-        
+
         // Extract source path (prefer _ab_source_file_url for backwards compatibility)
         val sourcePath = sourceFileUrl ?: documentKey ?: fileName
-        
+
         // Use updated_at from file transfer mode if available, otherwise fall back to _ab_source_file_last_modified
         val docUpdatedAt = (updatedAt ?: lastModified)?.let { parseAndFormatTimestamp(it) }
-        
+
+        // --- New metadata fields added by custom source connectors ---
+
+        val contentType = dataNode.get("_ab_source_file_content_type")?.asText()
+        val createdAt = dataNode.get("_ab_source_file_created_at")?.asText()
+        val owner = dataNode.get("_ab_source_file_owner")?.asText()
+        val lastModifiedBy = dataNode.get("_ab_source_file_last_modified_by")?.asText()
+        val sharedNode = dataNode.get("_ab_source_file_shared")
+        val shared = if (sharedNode != null && !sharedNode.isNull) sharedNode.asBoolean() else null
+
+        // Prefer actual file size from source (_ab_source_file_size) over serialized record size
+        val fileSizeFromSourceNode = dataNode.get("_ab_source_file_size")
+        val fileSizeFromSource = if (fileSizeFromSourceNode != null && !fileSizeFromSourceNode.isNull && fileSizeFromSourceNode.isNumber) {
+            fileSizeFromSourceNode.asLong()
+        } else {
+            null
+        }
+        val effectiveFileSizeBytes = fileSizeFromSource ?: recordSizeBytes
+
+        val storageClass = dataNode.get("_ab_source_file_storage_class")?.asText()
+        val accessTier = dataNode.get("_ab_source_file_access_tier")?.asText()
+        val prefixPath = dataNode.get("_ab_source_file_prefix_path")?.asText()
+
+        // These are JSON strings serialized by the source connector
+        val userMetadata = dataNode.get("_ab_source_file_user_metadata")?.asText()
+        val objectTags = dataNode.get("_ab_source_file_object_tags")?.asText()
+        val blobMetadata = dataNode.get("_ab_source_file_blob_metadata")?.asText()
+        val containerMetadata = dataNode.get("_ab_source_file_container_metadata")?.asText()
+        val customMetadata = dataNode.get("_ab_source_file_custom_metadata")?.asText()
+
+        // SharePoint-specific fields
+        val siteName = dataNode.get("_ab_source_file_site_name")?.asText()
+        val libraryName = dataNode.get("_ab_source_file_library_name")?.asText()
+
         return DocumentMetadata(
             name = name,
             type = type,
             sourcePath = sourcePath,
             docUpdatedAt = docUpdatedAt,
-            fileSizeBytes = recordSizeBytes,
+            fileSizeBytes = effectiveFileSizeBytes,
             fileId = fileId,
-            sourceUri = sourceUri
+            sourceUri = sourceUri,
+            contentType = contentType,
+            createdAt = createdAt,
+            owner = owner,
+            lastModifiedBy = lastModifiedBy,
+            shared = shared,
+            fileSizeFromSource = fileSizeFromSource,
+            storageClass = storageClass,
+            accessTier = accessTier,
+            prefixPath = prefixPath,
+            userMetadata = userMetadata,
+            objectTags = objectTags,
+            blobMetadata = blobMetadata,
+            containerMetadata = containerMetadata,
+            customMetadata = customMetadata,
+            siteName = siteName,
+            libraryName = libraryName,
         )
     }
     

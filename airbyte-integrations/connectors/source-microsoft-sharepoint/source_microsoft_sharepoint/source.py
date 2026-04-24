@@ -7,9 +7,13 @@ from typing import Any, Mapping, Optional
 
 from airbyte_cdk import AdvancedAuth, ConfiguredAirbyteCatalog, ConnectorSpecification, OAuthConfigSpecification, TState
 from airbyte_cdk.models import AuthFlowType, OauthConnectorInputSpecification
+from airbyte_cdk.sources.file_based.config.file_based_stream_config import FileBasedStreamConfig
 from airbyte_cdk.sources.file_based.file_based_source import FileBasedSource
+from airbyte_cdk.sources.file_based.stream import AbstractFileBasedStream
+from airbyte_cdk.sources.file_based.stream.cursor import AbstractFileBasedCursor
 from airbyte_cdk.sources.file_based.stream.cursor.default_file_based_cursor import DefaultFileBasedCursor
 from source_microsoft_sharepoint.spec import SourceMicrosoftSharePointSpec
+from source_microsoft_sharepoint.stream import SharePointStream
 from source_microsoft_sharepoint.stream_reader import SourceMicrosoftSharePointStreamReader
 from source_microsoft_sharepoint.utils import PlaceholderUrlBuilder
 
@@ -25,6 +29,22 @@ class SourceMicrosoftSharePoint(FileBasedSource):
             config=config,
             state=state,
             cursor_cls=DefaultFileBasedCursor,
+        )
+
+    def _make_default_stream(
+        self, stream_config: FileBasedStreamConfig, cursor: Optional[AbstractFileBasedCursor], parsed_config: Any
+    ) -> AbstractFileBasedStream:
+        """Override to use SharePointStream which adds document metadata fields to records."""
+        return SharePointStream(
+            config=stream_config,
+            catalog_schema=self.stream_schemas.get(stream_config.name),
+            stream_reader=self.stream_reader,
+            availability_strategy=self.availability_strategy,
+            discovery_policy=self.discovery_policy,
+            parsers=self.parsers,
+            validation_policy=self._validate_and_get_validation_policy(stream_config),
+            errors_collector=self.errors_collector,
+            cursor=cursor,
         )
 
     def spec(self, *args: Any, **kwargs: Any) -> ConnectorSpecification:

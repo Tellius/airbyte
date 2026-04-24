@@ -143,13 +143,17 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
                 "sourcePath=${metadata.sourcePath}"
             }
             
-            log.info { 
+            log.info {
                 "Sending document to middleware API:\n" +
                 "  Document: ${metadata.name}\n" +
                 "  Source: $sourceInfo\n" +
                 "  User: $userIdInfo\n" +
                 "  Method: ${request.method()}\n" +
-                "  URL: ${request.uri()}"
+                "  URL: ${request.uri()}\n" +
+                "  content_type=${metadata.contentType}, prefix_path=${metadata.prefixPath}, " +
+                "  storage_class=${metadata.storageClass}, access_tier=${metadata.accessTier}, " +
+                "  owner=${metadata.owner}, created_at=${metadata.createdAt}, " +
+                "  file_size_from_source=${metadata.fileSizeFromSource}"
             }
             
             log.debug { 
@@ -258,72 +262,104 @@ class MiddlewareApiClient(private val datasourceId: String? = null) {
      */
     private fun buildPayload(metadata: DocumentMetadata): String {
         val payload = objectMapper.createObjectNode()
-        
+
         // Generate a NEW random UUID for this middleware entry
         // Each sync creates a new entry with a unique ID
         payload.put("id", UUID.randomUUID().toString())
-        
+
         // Add required fields
         payload.put("name", metadata.name ?: "unknown")
         payload.put("type", metadata.type ?: "unknown")
         payload.put("internal_path", metadata.internalPath ?: "")
-        
+
         // Format timestamp to match middleware expectations (no timezone, with microseconds)
         val formattedTimestamp = formatTimestampForMiddleware(metadata.docUpdatedAt)
         payload.put("doc_updated_at", formattedTimestamp ?: "")
-        
-        // Ensure file_size_bytes is an integer (not too large for Int type)
-        val fileSizeInt = if (metadata.fileSizeBytes > Int.MAX_VALUE) {
-            Int.MAX_VALUE
-        } else {
-            metadata.fileSizeBytes.toInt()
-        }
+
+        // Prefer actual file size from source (_ab_source_file_size) over serialized record size
+        val effectiveFileSize = metadata.fileSizeFromSource ?: metadata.fileSizeBytes
+        val fileSizeInt = effectiveFileSize.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
         payload.put("file_size_bytes", fileSizeInt)
-        
+
         payload.put("source_path", metadata.sourcePath ?: "")
-        
+
         // Add datasource_id if available from datasource lookup
         // Note: user_id is sent in USERID header, NOT in payload
         if (cachedDatasourceId != null) {
             payload.put("datasource_id", cachedDatasourceId)
         }
-        
-        // Add meta_data with deterministic UUID for tracking the source document
-        // This fingerprint stays the same across syncs for the same source document
-        // Priority: fileId > sourcePath > name
-        // - fileId (Google Drive, SharePoint): Prevents collisions from duplicate filenames
-        // - sourcePath (S3, Azure Blob, Gong): Uses unique path as identifier
+
+        // Build meta_data JSONB object
+        // Contains: deterministic fingerprint for dedup, source identifiers, and all
+        // new document metadata fields extracted from the source connectors.
         val metaDataObject = objectMapper.createObjectNode()
-        
-        // Determine which field to use for fingerprint generation
+
+        // Deterministic fingerprint — stays the same across syncs for the same source document.
+        // Priority: fileId (GDrive/SharePoint) > sourcePath (S3/Azure/GCS/Gong) > name
         val (fingerprintInput, fieldUsed) = when {
             metadata.fileId?.isNotBlank() == true -> Pair(metadata.fileId, "fileId")
             metadata.sourcePath?.isNotBlank() == true -> Pair(metadata.sourcePath, "sourcePath")
             metadata.name?.isNotBlank() == true -> Pair(metadata.name, "name")
             else -> Pair("unknown", "fallback")
         }
-        
+
         val documentFingerprint = generateDeterministicUUID(fingerprintInput)
-        
-        log.info { 
+
+        log.info {
             "Generated document_fingerprint for '${metadata.name}': " +
             "field_used=$fieldUsed, value='$fingerprintInput', fingerprint=$documentFingerprint"
         }
-        
+
         metaDataObject.put("document_fingerprint", documentFingerprint)
         metaDataObject.put("airbyte_sync_timestamp", System.currentTimeMillis())
-        
-        // Add source file ID and redirect URI if available (from Google Drive, SharePoint, etc.)
-        // These enable creating redirect links back to the source file
+
+        // Source file identifiers (Google Drive, SharePoint)
         if (!metadata.fileId.isNullOrBlank()) {
             metaDataObject.put("source_file_id", metadata.fileId)
         }
         if (!metadata.sourceUri.isNullOrBlank()) {
             metaDataObject.put("source_redirect_uri", metadata.sourceUri)
         }
-        
+
+        // --- New document metadata fields (Phase 2) ---
+
+        // Common across all sources
+        metadata.contentType?.let      { metaDataObject.put("content_type", it) }
+        metadata.prefixPath?.let       { metaDataObject.put("prefix_path", it) }
+
+        // GDrive-specific
+        metadata.createdAt?.let        { metaDataObject.put("created_at", it) }
+        metadata.owner?.let            { metaDataObject.put("owner", it) }
+        metadata.lastModifiedBy?.let   { metaDataObject.put("last_modified_by", it) }
+        metadata.shared?.let           { metaDataObject.put("shared", it) }
+
+        // S3 / GCS storage class
+        metadata.storageClass?.let     { metaDataObject.put("storage_class", it) }
+
+        // Azure access tier
+        metadata.accessTier?.let       { metaDataObject.put("access_tier", it) }
+
+        // S3 user metadata and object tags (stored as JSON strings by the source connector)
+        metadata.userMetadata?.let     { metaDataObject.put("user_metadata", it) }
+        metadata.objectTags?.let       { metaDataObject.put("object_tags", it) }
+
+        // Azure blob and container metadata (JSON strings)
+        metadata.blobMetadata?.let     { metaDataObject.put("blob_metadata", it) }
+        metadata.containerMetadata?.let { metaDataObject.put("container_metadata", it) }
+
+        // GCS custom metadata (JSON string)
+        metadata.customMetadata?.let   { metaDataObject.put("custom_metadata", it) }
+
+        // SharePoint-specific fields
+        metadata.siteName?.let         { metaDataObject.put("site_name", it) }
+        metadata.libraryName?.let      { metaDataObject.put("library_name", it) }
+
+        // Actual file size from source (for informational purposes; file_size_bytes top-level
+        // is already set to this value, but also store here for downstream queries on meta_data)
+        metadata.fileSizeFromSource?.let { metaDataObject.put("file_size_bytes_source", it) }
+
         payload.set<ObjectNode>("meta_data", metaDataObject)
-        
+
         return objectMapper.writeValueAsString(payload)
     }
     

@@ -16,6 +16,7 @@ from airbyte_cdk.sources.file_based.file_based_stream_reader import AbstractFile
 from airbyte_cdk.sources.file_based.remote_file import RemoteFile
 from airbyte_cdk.sources.streams.http.requests_native_auth import Oauth2Authenticator
 
+from .remote_file import AzureRemoteFile
 from .spec import SourceAzureBlobStorageSpec
 
 
@@ -131,9 +132,61 @@ class SourceAzureBlobStorageStreamReader(AbstractFileBasedStreamReader):
         prefixes = [prefix] if prefix else self.get_prefixes_from_globs(globs)
         prefixes = prefixes or [None]
         try:
+            # Fetch container-level metadata once per sync — single API call shared across all blobs.
+            container_client = self.azure_container_client
+            try:
+                container_props = container_client.get_container_properties()
+                raw_container_metadata = container_props.get("metadata") or {}
+                container_metadata = dict(raw_container_metadata) if raw_container_metadata else None
+                logger.info(
+                    f"[Azure] Container metadata fetched — "
+                    f"container={self.config.azure_blob_storage_container_name!r}, "
+                    f"keys={list(container_metadata.keys()) if container_metadata else []}"
+                )
+            except Exception as e:
+                container_metadata = None
+                logger.warning(f"[Azure] Failed to fetch container metadata: {e}")
+
             for prefix in prefixes:
-                for blob in self.azure_container_client.list_blobs(name_starts_with=prefix):
-                    remote_file = RemoteFile(uri=blob.name, last_modified=blob.last_modified.astimezone(pytz.utc).replace(tzinfo=None))
+                for blob in container_client.list_blobs(name_starts_with=prefix):
+                    last_modified = blob.last_modified.astimezone(pytz.utc).replace(tzinfo=None)
+
+                    content_settings = getattr(blob, "content_settings", None)
+                    content_type = content_settings.content_type if content_settings else None
+
+                    created_at_raw = getattr(blob, "creation_time", None)
+                    created_at = created_at_raw.astimezone(pytz.utc).replace(tzinfo=None) if created_at_raw else None
+
+                    size = getattr(blob, "size", None)
+                    access_tier = getattr(blob, "blob_tier", None)
+                    raw_metadata = getattr(blob, "metadata", None)
+                    blob_metadata = dict(raw_metadata) if raw_metadata else None
+                    # Derive prefix path from blob.name — everything before the last "/"
+                    # e.g. "Pharma/Sales/Q1/report.pdf" → "Pharma/Sales/Q1"
+                    blob_name_parts = blob.name.split("/")
+                    prefix_path = "/".join(blob_name_parts[:-1])
+
+                    remote_file = AzureRemoteFile(
+                        uri=blob.name,
+                        last_modified=last_modified,
+                        content_type=content_type,
+                        created_at=created_at,
+                        size=size,
+                        access_tier=str(access_tier) if access_tier is not None else None,
+                        blob_metadata=blob_metadata,
+                        prefix_path=prefix_path,
+                        container_metadata=container_metadata,
+                    )
+
+                    logger.info(
+                        f"[Azure] Metadata captured for {blob.name!r} — "
+                        f"content_type={content_type}, size={size}, "
+                        f"access_tier={access_tier}, created_at={created_at}, "
+                        f"prefix_path={prefix_path!r}, "
+                        f"blob_metadata_keys={list(blob_metadata.keys()) if blob_metadata else []}, "
+                        f"container_metadata_keys={list(container_metadata.keys()) if container_metadata else []}"
+                    )
+
                     yield from self.filter_files_by_globs_and_start_date([remote_file], globs)
         except ResourceNotFoundError as e:
             raise AirbyteTracedException(failure_type=FailureType.config_error, internal_message=e.message, message=e.reason or e.message)

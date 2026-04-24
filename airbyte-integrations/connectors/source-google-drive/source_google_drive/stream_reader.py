@@ -67,6 +67,18 @@ class GoogleDriveRemoteFile(RemoteFile):
     # Only populated for items in shared drives.
     drive_id: Optional[str] = None
     created_at: datetime
+    # Owner email address — first owner in the owners list from the Drive API
+    owner: Optional[str] = None
+    # Email address of the user who last modified the file
+    last_modified_by: Optional[str] = None
+    # Whether the file has been shared with anyone
+    shared: Optional[bool] = None
+    # File size in bytes — None for Google-native docs (Docs/Sheets/Slides/Drawings)
+    size: Optional[int] = None
+    # Full folder path relative to the configured root (e.g. "Projects/Pharma/Oncology/Reports").
+    # Empty string for files directly in the root folder.
+    # Built for free from the BFS traversal — no extra API calls needed.
+    folder_path: Optional[str] = None
 
     @property
     def url(self) -> str:
@@ -148,7 +160,7 @@ class SourceGoogleDriveStreamReader(AbstractFileBasedStreamReader):
             request = service.files().list(
                 q=f"'{folder_id}' in parents",
                 pageSize=1000,
-                fields="nextPageToken, files(id, name, modifiedTime, mimeType, webViewLink, driveId, createdTime)",
+                fields="nextPageToken, files(id, name, modifiedTime, mimeType, webViewLink, driveId, createdTime, owners, lastModifyingUser, shared, size)",
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
             )
@@ -178,6 +190,20 @@ class SourceGoogleDriveStreamReader(AbstractFileBasedStreamReader):
                             if self._is_exportable_document(original_mime_type)
                             else original_mime_type
                         )
+
+                        owners = new_file.get("owners", [])
+                        owner_email = owners[0].get("emailAddress") if owners else None
+
+                        last_modifying_user = new_file.get("lastModifyingUser", {})
+                        last_modified_by_email = last_modifying_user.get("emailAddress") if last_modifying_user else None
+
+                        raw_size = new_file.get("size")
+                        file_size = int(raw_size) if raw_size is not None else None
+
+                        # path is the BFS-accumulated folder prefix (e.g. "Projects/Pharma/Reports/")
+                        # Strip the trailing slash to get a clean folder path.
+                        folder_path = path.rstrip("/")
+
                         remote_file = GoogleDriveRemoteFile(
                             uri=file_name,
                             last_modified=last_modified,
@@ -187,7 +213,29 @@ class SourceGoogleDriveStreamReader(AbstractFileBasedStreamReader):
                             mime_type=mime_type,
                             drive_id=new_file.get("driveId"),
                             view_link=new_file.get("webViewLink"),
+                            owner=owner_email,
+                            last_modified_by=last_modified_by_email,
+                            shared=new_file.get("shared"),
+                            size=file_size,
+                            folder_path=folder_path,
                         )
+
+                        logger.info(
+                            f"[GDrive] Metadata captured for {file_name!r} — "
+                            f"mime_type={original_mime_type}, "
+                            f"created_at={created_at.isoformat()}, "
+                            f"owner={owner_email}, "
+                            f"last_modified_by={last_modified_by_email}, "
+                            f"shared={new_file.get('shared')}, "
+                            f"size={file_size}, "
+                            f"folder_path={folder_path!r}"
+                        )
+                        if file_size is None:
+                            logger.warning(
+                                f"[GDrive] size not available for {file_name!r} "
+                                f"(mime_type={original_mime_type}) — expected for Google-native documents"
+                            )
+
                         if self.file_matches_globs(remote_file, globs):
                             yield remote_file
                 request = service.files().list_next(request, results)

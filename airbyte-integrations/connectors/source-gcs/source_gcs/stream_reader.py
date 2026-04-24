@@ -182,7 +182,7 @@ class SourceGCSStreamReader(AbstractFileBasedStreamReader):
                         # STABLE identifier - always gs:// path (for fingerprint generation)
                         # This stays the same across syncs, unlike signed URLs
                         stable_id = f"gs://{blob.bucket.name}/{blob.name}"
-                        
+
                         if self.config.credentials.auth_type == "Client":
                             # OAuth: gs:// path can be used directly for download
                             download_url = stable_id
@@ -191,13 +191,39 @@ class SourceGCSStreamReader(AbstractFileBasedStreamReader):
                             download_url = blob.generate_signed_url(expiration=timedelta(days=7), version="v4")
 
                         file_extension = ".".join(blob.name.split(".")[1:])
-                        
+
+                        blob_content_type = blob.content_type
+                        blob_created_at = blob.time_created.astimezone(pytz.utc).replace(tzinfo=None) if blob.time_created else None
+                        blob_size = blob.size
+                        blob_storage_class = blob.storage_class
+                        blob_custom_metadata = dict(blob.metadata) if blob.metadata else None
+                        # Derive prefix path from blob.name — everything before the last "/"
+                        # e.g. "Pharma/Sales/Q1/report.pdf" → "Pharma/Sales/Q1"
+                        blob_name_parts = blob.name.split("/")
+                        blob_prefix_path = "/".join(blob_name_parts[:-1])
+
                         remote_file = GCSRemoteFile(
-                            uri=download_url,           # For open_file() compatibility
+                            uri=download_url,                     # For open_file() compatibility
                             last_modified=last_modified,
                             mime_type=file_extension,
-                            id=stable_id,               # Stable identifier for fingerprinting
-                            download_url=download_url   # URL for downloading the file
+                            id=stable_id,                         # Stable identifier for fingerprinting
+                            download_url=download_url,            # URL for downloading the file
+                            content_type=blob_content_type,
+                            created_at=blob_created_at,
+                            size=blob_size,
+                            storage_class=blob_storage_class,
+                            custom_metadata=blob_custom_metadata,
+                            prefix_path=blob_prefix_path,
+                        )
+
+                        logger.info(
+                            f"[GCS] Metadata captured for {stable_id!r} — "
+                            f"content_type={blob_content_type}, "
+                            f"size={blob_size}, "
+                            f"storage_class={blob_storage_class}, "
+                            f"created_at={blob_created_at}, "
+                            f"prefix_path={blob_prefix_path!r}, "
+                            f"custom_metadata_keys={list(blob_custom_metadata.keys()) if blob_custom_metadata else []}"
                         )
 
                         if file_extension == "zip":

@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from office365.graph_client import GraphClient
 from office365.onedrive.sites.site import Site
@@ -27,9 +27,43 @@ class FolderNotFoundException(Exception):
     pass
 
 
+def _extract_user_identity(identity) -> Optional[str]:
+    """
+    Return email (preferred) or displayName from a user identity.
+
+    Handles two forms depending on which listing code path is used:
+    - Raw dict user object {"email": "...", "displayName": "..."} — from _get_shared_drive_object
+      (called with the pre-extracted .get("createdBy", {}).get("user", {}))
+    - office365 SDK IdentitySet object — from _list_directories_and_files (item.properties)
+      (called with the whole IdentitySet; accesses .user attribute, then .email / .display_name)
+
+    Also handles None gracefully (e.g. service principals with no user).
+    """
+    if identity is None:
+        return None
+    if isinstance(identity, dict):
+        # Called with a raw user sub-dict: {"email": ..., "displayName": ...}
+        return identity.get("email") or identity.get("displayName")
+    # office365 SDK IdentitySet object — extract the nested Identity (.user)
+    user = getattr(identity, "user", None)
+    if user is None:
+        return None
+    # Identity object has email and display_name (snake_case) in the office365 SDK
+    return getattr(user, "email", None) or getattr(user, "display_name", None)
+
+
 class MicrosoftSharePointRemoteFile(RemoteFile):
     download_url: str
     created_at: datetime
+    content_type: Optional[str] = None
+    size: Optional[int] = None
+    author: Optional[str] = None          # email → displayName fallback
+    last_modified_by: Optional[str] = None
+    site_name: Optional[str] = None
+    library_name: Optional[str] = None
+    prefix_path: Optional[str] = None
+    item_id: Optional[str] = None         # reserved for future metadata columns lazy fetch
+    drive_id: Optional[str] = None        # reserved for future metadata columns lazy fetch
 
 
 def filter_http_urls(files, logger):

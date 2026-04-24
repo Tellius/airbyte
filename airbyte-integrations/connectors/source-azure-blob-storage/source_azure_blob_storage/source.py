@@ -3,13 +3,33 @@
 #
 
 
-from typing import Any
+from typing import Any, Optional
 
 from airbyte_cdk import AdvancedAuth, ConnectorSpecification, OAuthConfigSpecification
+from airbyte_cdk.sources.file_based.config.file_based_stream_config import FileBasedStreamConfig
 from airbyte_cdk.sources.file_based.file_based_source import FileBasedSource
+from airbyte_cdk.sources.file_based.stream import AbstractFileBasedStream
+from airbyte_cdk.sources.file_based.stream.cursor import AbstractFileBasedCursor
+from source_azure_blob_storage.stream import AzureBlobStream
 
 
 class SourceAzureBlobStorage(FileBasedSource):
+    def _make_default_stream(
+        self, stream_config: FileBasedStreamConfig, cursor: Optional[AbstractFileBasedCursor]
+    ) -> AbstractFileBasedStream:
+        """Override to use AzureBlobStream which emits document metadata fields per the PRD."""
+        return AzureBlobStream(
+            config=stream_config,
+            catalog_schema=self.stream_schemas.get(stream_config.name),
+            stream_reader=self.stream_reader,
+            availability_strategy=self.availability_strategy,
+            discovery_policy=self.discovery_policy,
+            parsers=self.parsers,
+            validation_policy=self._validate_and_get_validation_policy(stream_config),
+            errors_collector=self.errors_collector,
+            cursor=cursor,
+        )
+
     def spec(self, *args: Any, **kwargs: Any) -> ConnectorSpecification:
         """
         Returns the specification describing what fields can be configured by a user when setting up a file-based source.
