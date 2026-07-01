@@ -31,11 +31,19 @@ There are two ECR repositories in use:
 | **S3** | `source-s3-tellius-release-1.8.0-v3` | 2026-04-22 | `python-connector-base-tellius-release-v2` |
 | **SharePoint** | `source-sharepoint-tellius-release-1.8.0-v2` | 2026-04-22 | `python-connector-base-tellius-release-v2` |
 
+### Manifest-Only Source Connectors
+
+Declarative (YAML) connectors built on Airbyte's `source-declarative-manifest` runner — no custom Python base / OCR parser (these ingest API records, not files).
+
+| Component | Current Tag | Date Deployed | Based On |
+|-----------|-------------|---------------|----------|
+| **Granola** | `source-granola-tellius-release-0.2.1-v1` | 2026-06-01 | `docker.io/airbyte/source-declarative-manifest:7.17.2` |
+
 ### Kotlin/Java Destination Connectors
 
 | Component | Current Tag | Date Deployed | Based On |
 |-----------|-------------|---------------|----------|
-| **Destination S3** | `destination-s3-tellius-release-1.8.0-v5` | 2026-04-22 | `docker.io/airbyte/java-connector-base:2.0.1` |
+| **Destination S3** | `destination-s3-tellius-release-1.8.0-v7` | 2026-06-01 | `docker.io/airbyte/java-connector-base:2.0.1` |
 
 ---
 
@@ -53,10 +61,15 @@ python-connector-base-tellius-release-v2               (Custom base: tellius-ocr
          ├──▶ source-s3-tellius-release-1.8.0-v3
          └──▶ source-sharepoint-tellius-release-1.8.0-v2
 
+docker.io/airbyte/source-declarative-manifest:7.17.2  (Airbyte official manifest runner)
+         │
+         ▼
+source-granola-tellius-release-0.2.1-v1               (Manifest-only: adds web_url to notes/detailed_notes schema)
+
 docker.io/airbyte/java-connector-base:2.0.1            (Airbyte official Java base)
          │
          ▼
-destination-s3-tellius-release-1.8.0-v5               (Custom destination: DocumentMetadataCollector + MiddlewareApiClient)
+destination-s3-tellius-release-1.8.0-v7               (Custom destination: DocumentMetadataCollector + MiddlewareApiClient)
 ```
 
 ---
@@ -131,6 +144,16 @@ The custom base image extends Airbyte's official `python-connector-base` with:
 | `source-sharepoint-tellius-release-1.8.0-v1` | 2026-03-31 | Initial production release on `python-connector-base-tellius-release-v2`. Full Mistral OCR support for PDF, DOCX, PPTX. Connector version: `source-microsoft-sharepoint 0.10.3`. |
 | `source-sharepoint-tellius-release-1.8.0-v2` | 2026-04-22 | **Document Metadata feature.** Extends `MicrosoftSharePointRemoteFile` with 8 new fields. Adds `_ab_source_file_content_type`, `_ab_source_file_prefix_path`, `_ab_source_file_size`, `_ab_source_file_created_at`, `_ab_source_file_owner`, `_ab_source_file_last_modified_by`, `_ab_source_file_site_name`, `_ab_source_file_library_name` via new `SharePointStream` (CDK ^6 `transform_record()` override). Email → displayName fallback for user identity fields. |
 
+### Granola (`source-granola-tellius-release-*`)
+
+> **ECR path:** `956938892320.dkr.ecr.us-east-1.amazonaws.com/airbyte`
+> **Airbyte DB `actor_definition_id`:** `9023923c-002f-4131-9554-3ebdf56540a4`
+> **Type:** manifest-only (declarative YAML) — not built on the custom Python base.
+
+| Tag | Date | Changes |
+|-----|------|---------|
+| `source-granola-tellius-release-0.2.1-v1` | 2026-06-01 | Initial release. New manifest-only connector for Granola (Enterprise/Admin Notes API, `api_key` auth). Two streams: `notes` (light index — id/title/owner/created_at) and `detailed_notes` (rich — summary, transcript, attendees, calendar_event, folders). **Adds `web_url` to both stream schemas** so the Airbyte CDK does not strip Granola's per-note permalink (`https://notes.granola.ai/d/{uuid}`) — the CDK drops undeclared fields despite `additionalProperties: true`. Downstream, only `detailed_notes` is selected for ingestion. |
+
 ### Destination S3 (`destination-s3-tellius-release-*`)
 
 > **ECR path:** `956938892320.dkr.ecr.us-east-1.amazonaws.com/airbyte`
@@ -143,6 +166,8 @@ The custom base image extends Airbyte's official `python-connector-base` with:
 | `destination-s3-tellius-release-1.8.0-v3` | 2026-xx-xx | Adds `source_file_id` and `source_redirect_uri` to `meta_data` (Google Drive / SharePoint file linking). |
 | `destination-s3-tellius-release-1.8.0-v4` | 2026-04-21 | **Phase 2 — Full document metadata wiring.** Extracts all new `_ab_source_file_*` fields from Airbyte records and stores them in the middleware `meta_data` JSONB column: `content_type`, `prefix_path`, `created_at`, `owner`, `last_modified_by`, `shared`, `storage_class`, `access_tier`, `user_metadata`, `object_tags`, `blob_metadata`, `container_metadata`, `custom_metadata`. Also fixes `file_size_bytes` to use actual source file size (`_ab_source_file_size`) instead of serialized record size. |
 | `destination-s3-tellius-release-1.8.0-v5` | 2026-04-22 | **SharePoint metadata wiring.** Adds extraction of `_ab_source_file_site_name` → `site_name` and `_ab_source_file_library_name` → `library_name` into `meta_data`. Image moved from `release/airbyte` to `airbyte` ECR repository. |
+| `destination-s3-tellius-release-1.8.0-v6` | 2026-05-29 | **Slack metadata wiring.** Adds Slack-specific branch in `DocumentMetadataCollector` (`tryExtractFromSlackSource`) that produces middleware-notifiable `DocumentMetadata` for three streams: `channels`, `users`, and `channel_messages` (thread parents only). Each emits a real Slack permalink as `sourcePath` (`https://app.slack.com/...`), so links from Tellius UI deep-link back into Slack. Destination-side filters mirror the ingestion-side filters: skip deleted/bot/Slackbot users; skip system-event message subtypes (`channel_join`, `channel_leave`, `channel_archive`/`unarchive`, `channel_topic`/`purpose`/`name`, `bot_add`/`remove`); skip thread replies (parents only — replies are aggregated into the parent's UnifiedDocument by the airflow SlackExtractor). |
+| `destination-s3-tellius-release-1.8.0-v7` | 2026-06-01 | **Granola metadata wiring.** Adds `tryExtractFromGranolaSource` branch in `DocumentMetadataCollector` (routed before the generic API extractor). Emits middleware-notifiable `DocumentMetadata` only for `detailed_notes` records (rich content: `summary_markdown`/`summary_text`/`transcript`/`attendees`); skips the light `notes` index stream (used by the airflow GranolaExtractor as enrichment only). `type = granola_note`; `sourcePath` resolves to the real Granola permalink (`https://notes.granola.ai/d/{uuid}`) via the `web_url` field declared in the source manifest. |
 
 ---
 

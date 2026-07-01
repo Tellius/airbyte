@@ -143,16 +143,182 @@ object DocumentMetadataExtractor {
      * Detects source type and routes to appropriate extraction method.
      */
     private fun extractFromDataNode(dataNode: JsonNode, recordSizeBytes: Long): DocumentMetadata {
+        // Slack first: its records share top-level field names (`name`, `id`) with
+        // the generic API extractor, so the generic extractor would otherwise pull
+        // the wrong fields for channels/users.
+        val slackMetadata = tryExtractFromSlackSource(dataNode, recordSizeBytes)
+        if (slackMetadata != null && slackMetadata.hasEssentialMetadata()) {
+            return slackMetadata
+        }
+
+        // Granola: same as Slack — only `detailed_notes` records become documents;
+        // the lighter `notes` index stream is skipped (used by airflow extractor
+        // as substream enrichment only).
+        val granolaMetadata = tryExtractFromGranolaSource(dataNode, recordSizeBytes)
+        if (granolaMetadata != null && granolaMetadata.hasEssentialMetadata()) {
+            return granolaMetadata
+        }
+
         // Check for API-based sources first (Gong, Salesforce, etc.)
         val apiMetadata = tryExtractFromApiSource(dataNode, recordSizeBytes)
         if (apiMetadata != null && apiMetadata.hasEssentialMetadata()) {
             return apiMetadata
         }
-        
+
         // Fall back to file-based extraction (Google Drive, S3, etc.)
         return extractFromFileSource(dataNode, recordSizeBytes)
     }
+
+    /** Slack message subtypes that are pure system events; never useful for retrieval. */
+    private val SLACK_SYSTEM_MESSAGE_SUBTYPES = setOf(
+        "channel_join", "channel_leave",
+        "channel_archive", "channel_unarchive",
+        "channel_topic", "channel_purpose", "channel_name",
+        "bot_add", "bot_remove",
+    )
+
+    /**
+     * Extract document metadata from Slack records (source-slack).
+     *
+     * Only `channel_messages` thread parents notify middleware. `channels` and
+     * `users` records ARE still written to S3 as JSONL (Airbyte does that
+     * regardless of middleware notification), but they aren't documents in
+     * their own right — the airflow SlackExtractor reads those sibling JSONLs
+     * as lookup tables to enrich each thread document with channel context
+     * (name/topic/purpose) and per-message speaker info (real_name/title).
+     *
+     * Mirrors the Gong shape: one document per conversational unit (a thread
+     * for Slack, a call for Gong), with all participant/context data baked in
+     * — no separate user-card or channel-card documents.
+     *
+     * Filters on the message branch:
+     *  - skip thread replies (thread_ts != null && thread_ts != ts) so the
+     *    extractor's per-thread aggregation has a single doc_id to attach
+     *    replies to
+     *  - skip system event subtypes (channel_join, leave, topic, etc.)
+     */
+    private fun tryExtractFromSlackSource(dataNode: JsonNode, recordSizeBytes: Long): DocumentMetadata? {
+        val id = dataNode.get("id")?.asText()
+
+        // Channel records: don't notify middleware — the channel data is used by
+        // the airflow extractor as enrichment for thread documents only.
+        if (dataNode.get("is_channel")?.asBoolean() == true && id?.startsWith("C") == true) {
+            return null
+        }
+
+        // User records: same — enrichment-only, never their own document.
+        if (id?.startsWith("U") == true && dataNode.has("team_id") && !dataNode.has("channel_id")) {
+            return null
+        }
+
+        // ─── channel_messages (thread parents and standalone) ────────────────
+        val type = dataNode.get("type")?.asText()
+        val channelId = dataNode.get("channel_id")?.asText()
+        val ts = dataNode.get("ts")?.asText()
+        if (type == "message" && !channelId.isNullOrBlank() && !ts.isNullOrBlank()) {
+            // Skip replies — the SlackExtractor aggregates them into the parent's document.
+            val threadTs = dataNode.get("thread_ts")?.asText()
+            if (!threadTs.isNullOrBlank() && threadTs != ts) return null
+
+            // Skip system event subtypes (channel_join, leave, topic changes, etc.)
+            val subtype = dataNode.get("subtype")?.asText()
+            if (subtype != null && subtype in SLACK_SYSTEM_MESSAGE_SUBTYPES) return null
+
+            val text = dataNode.get("text")?.asText().orEmpty()
+            val nameSnippet = if (text.isNotBlank()) text.take(80) else "Message $ts"
+
+            // Canonical Slack message permalink: archives/{channel}/p{ts with dot removed}
+            val tsCompact = ts.replace(".", "")
+            val sourcePath = "https://app.slack.com/archives/$channelId/p$tsCompact"
+
+            val docUpdatedAt = ts.toDoubleOrNull()?.let {
+                java.time.Instant.ofEpochMilli((it * 1000).toLong()).toString()
+            }
+
+            // type marker reflects whether this parent has replies (becomes a thread doc)
+            val docType = if (!threadTs.isNullOrBlank() && threadTs == ts) "slack_thread" else "slack_message"
+
+            log.debug { "Detected Slack message: ts=$ts channel=$channelId type=$docType" }
+            return DocumentMetadata(
+                name = nameSnippet,
+                type = docType,
+                sourcePath = sourcePath,
+                docUpdatedAt = docUpdatedAt,
+                fileSizeBytes = recordSizeBytes,
+            )
+        }
+
+        return null
+    }
     
+    /**
+     * Extract document metadata from Granola records (source-granola).
+     *
+     * Granola emits two streams:
+     *   - `notes`         — light index (id, title, owner, created_at). Records flow
+     *                       to S3 but DON'T notify middleware; the airflow
+     *                       GranolaExtractor uses these as substream parents only.
+     *   - `detailed_notes` — rich per-note (summary_text, summary_markdown,
+     *                       transcript[], attendees[], calendar_event, ...). One
+     *                       document per record.
+     *
+     * Discrimination: detailed_notes have at least one of `summary_markdown`,
+     * `summary_text`, `transcript`, or `attendees`. The `notes` index records
+     * never have those. We branch on field presence rather than stream name
+     * because Airbyte doesn't propagate the stream name into the data node
+     * uniformly across CDK versions.
+     *
+     * Mirrors the Gong/Slack pattern: one document per conversational unit
+     * (a meeting), with all participant/context data baked in.
+     */
+    private fun tryExtractFromGranolaSource(dataNode: JsonNode, recordSizeBytes: Long): DocumentMetadata? {
+        // Granola records always have object="note" (per manifest schema). Combined
+        // with the id-format check below, this protects against false positives
+        // from other API connectors.
+        val objectType = dataNode.get("object")?.asText()
+        if (objectType != "note") return null
+
+        val id = dataNode.get("id")?.asText() ?: return null
+
+        // Skip the light `notes` index stream: no rich fields → enrichment-only.
+        val hasRichContent = dataNode.has("summary_markdown") ||
+            dataNode.has("summary_text") ||
+            dataNode.has("transcript") ||
+            dataNode.has("attendees") ||
+            dataNode.has("updated_at")
+        if (!hasRichContent) return null
+
+        // Title may be null on minimal records — fall back to "Meeting <id>".
+        val title = dataNode.get("title")?.takeIf { !it.isNull }?.asText()
+        val nameValue = if (!title.isNullOrBlank()) title else "Meeting $id"
+
+        // source_path: prefer Granola's per-note permalink. The custom source image
+        // declares `web_url` in the manifest schema, so it survives the CDK (which
+        // strips undeclared fields). `url`/`share_url`/`permalink` are kept as
+        // historical aliases; the constructed URL is a last-resort fallback only
+        // (never hit in practice, since `web_url` is present on every detailed_note).
+        // Ordering matches the airflow GranolaExtractor's _build_source_path().
+        val sourcePath = dataNode.get("web_url")?.takeIf { !it.isNull }?.asText()
+            ?: dataNode.get("url")?.takeIf { !it.isNull }?.asText()
+            ?: dataNode.get("share_url")?.takeIf { !it.isNull }?.asText()
+            ?: dataNode.get("permalink")?.takeIf { !it.isNull }?.asText()
+            ?: "https://notes.granola.ai/t/$id"
+
+        // Prefer updated_at, fall back to created_at — both are ISO 8601 strings.
+        val timestamp = dataNode.get("updated_at")?.takeIf { !it.isNull }?.asText()
+            ?: dataNode.get("created_at")?.takeIf { !it.isNull }?.asText()
+        val docUpdatedAt = timestamp?.let { parseAndFormatTimestamp(it) }
+
+        log.debug { "Detected Granola detailed_note: id=$id title=$title" }
+        return DocumentMetadata(
+            name = nameValue,
+            type = "granola_note",
+            sourcePath = sourcePath,
+            docUpdatedAt = docUpdatedAt,
+            fileSizeBytes = recordSizeBytes,
+        )
+    }
+
     /**
      * Extract metadata from file-based sources (Google Drive, S3, GCS, Azure, etc.).
      */
