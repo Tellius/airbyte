@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from io import IOBase
 from os import getenv
-from os.path import basename, dirname
+from os.path import basename, dirname, isfile
 from typing import Dict, Iterable, List, Optional, Set, Tuple, cast
 
 import boto3.session
@@ -36,6 +36,12 @@ from source_s3.v4.zip_reader import DecompressedStream, RemoteFileInsideArchive,
 
 
 AWS_EXTERNAL_ID = getenv("AWS_ASSUME_ROLE_EXTERNAL_ID")
+# TEL-21303: default path for the Kubernetes-projected ServiceAccount token every pod gets,
+# even one Airbyte spun up with no AWS-specific wiring. When present, role_arn is assumed via
+# STS AssumeRoleWithWebIdentity using this token instead of requiring a pre-existing AWS identity.
+AWS_WEB_IDENTITY_TOKEN_FILE_PATH = getenv(
+    "AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/token"
+)
 
 
 class _S3BodyWrapper(io.RawIOBase):
@@ -125,12 +131,28 @@ class SourceS3StreamReader(AbstractFileBasedStreamReader):
         :return: An instance of a boto3 S3 client with the assumed role credentials.
 
         The method assumes a role specified in the `self.config.role_arn` and creates a session with the S3 service.
-        If `AWS_ASSUME_ROLE_EXTERNAL_ID` environment variable is set, it will be used during the role assumption for additional security.
+
+        Two ways to assume the role, tried in this order:
+          1. Web identity (TEL-21303): if the pod has a Kubernetes ServiceAccount token mounted at
+             AWS_WEB_IDENTITY_TOKEN_FILE_PATH, exchange it directly via STS AssumeRoleWithWebIdentity.
+             This needs no pre-existing AWS credentials at all -- the token itself is the credential --
+             so it works for a connector pod that Airbyte spun up with no AWS wiring of its own.
+          2. Plain AssumeRole (legacy / Airbyte Cloud): requires the caller to already have some AWS
+             identity via boto3's default credential chain. Kept as-is for backward compatibility with
+             existing Airbyte Cloud usage, optionally scoped with AWS_ASSUME_ROLE_EXTERNAL_ID.
         """
 
         def refresh():
             client = boto3.client("sts")
-            if AWS_EXTERNAL_ID:
+            if AWS_WEB_IDENTITY_TOKEN_FILE_PATH and isfile(AWS_WEB_IDENTITY_TOKEN_FILE_PATH):
+                with open(AWS_WEB_IDENTITY_TOKEN_FILE_PATH) as token_file:
+                    web_identity_token = token_file.read().strip()
+                role = client.assume_role_with_web_identity(
+                    RoleArn=self.config.role_arn,
+                    RoleSessionName="airbyte-source-s3",
+                    WebIdentityToken=web_identity_token,
+                )
+            elif AWS_EXTERNAL_ID:
                 role = client.assume_role(
                     RoleArn=self.config.role_arn,
                     RoleSessionName="airbyte-source-s3",
