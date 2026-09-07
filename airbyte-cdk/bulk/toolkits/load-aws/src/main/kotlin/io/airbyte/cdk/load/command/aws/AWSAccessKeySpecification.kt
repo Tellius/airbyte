@@ -38,12 +38,32 @@ interface AWSAccessKeySpecification {
     )
     val secretAccessKey: String?
 
+    // TEL-21303: temporary STS credentials carried in the connector config.
+    // A connector job pod that Airbyte creates for a sync has no identity of its own -- no
+    // ServiceAccount token (replication pods set automountServiceAccountToken: false), no AWS
+    // env vars, no mounted secrets. Its configuration is the only channel in, so short-lived
+    // credentials minted by the caller have to travel alongside the access key they belong to.
+    @get:JsonSchemaTitle("Session Token")
+    @get:JsonPropertyDescription(
+        "The session token for temporary credentials. Required when the access key ID and secret access key are short-lived credentials issued by AWS STS, and omitted for long-lived IAM user keys."
+    )
+    @get:JsonProperty("session_token")
+    @get:JsonSchemaInject(
+        json = """{"examples":["FwoGZXIvYXdzEBYaEXAMPLESESSIONTOKEN"],"airbyte_secret": true}"""
+    )
+    val sessionToken: String?
+        get() = null
+
     fun toAWSAccessKeyConfiguration(): AWSAccessKeyConfiguration {
-        return AWSAccessKeyConfiguration(accessKeyId, secretAccessKey)
+        return AWSAccessKeyConfiguration(accessKeyId, secretAccessKey, sessionToken)
     }
 }
 
-data class AWSAccessKeyConfiguration(val accessKeyId: String?, val secretAccessKey: String?)
+data class AWSAccessKeyConfiguration(
+    val accessKeyId: String?,
+    val secretAccessKey: String?,
+    val sessionToken: String? = null,
+)
 
 interface AWSAccessKeyConfigurationProvider {
     val awsAccessKeyConfiguration: AWSAccessKeyConfiguration

@@ -228,9 +228,18 @@ class S3ClientFactory(
 
         val credsProvider: CredentialsProvider =
             if (keyConfig.awsAccessKeyConfiguration.accessKeyId != null) {
+                // TEL-21303: session token is set when the caller passed short-lived STS
+                // credentials instead of long-lived IAM user keys. Leaving it null keeps the
+                // long-lived-key behaviour byte for byte.
+                if (keyConfig.awsAccessKeyConfiguration.sessionToken != null) {
+                    log.info {
+                        "Using temporary STS credentials supplied in the connector configuration"
+                    }
+                }
                 StaticCredentialsProvider {
                     accessKeyId = keyConfig.awsAccessKeyConfiguration.accessKeyId
                     secretAccessKey = keyConfig.awsAccessKeyConfiguration.secretAccessKey
+                    sessionToken = keyConfig.awsAccessKeyConfiguration.sessionToken
                 }
             } else if (
                 arnRole.awsArnRoleConfiguration.roleArn != null &&
