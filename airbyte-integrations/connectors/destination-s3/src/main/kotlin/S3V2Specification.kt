@@ -43,6 +43,13 @@ class S3V2Specification :
     )
     override val secretAccessKey: String? = null
 
+    // TEL-21303: must be a real property, not the interface's getter-only default --
+    // Jackson needs a backing field to populate from the config JSON.
+    @get:JsonSchemaInject(
+        json = """{"examples":["FwoGZXIvYXdzEBYaEXAMPLESESSIONTOKEN"],"airbyte_secret": true,"order":2}"""
+    )
+    override val sessionToken: String? = null
+
     @get:JsonSchemaInject(
         json =
             """{"examples":["arn:aws:iam::123456789:role/ExternalIdIsYourWorkspaceId"],"order":2}"""
