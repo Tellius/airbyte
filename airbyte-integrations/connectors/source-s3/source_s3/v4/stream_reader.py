@@ -112,10 +112,16 @@ class SourceS3StreamReader(AbstractFileBasedStreamReader):
             if self.config.role_arn:
                 self._s3_client = self._get_iam_s3_client(client_kv_args)
             else:
+                # TEL-21303: aws_session_token is set when the caller passed short-lived STS
+                # credentials rather than long-lived IAM user keys -- a connector job pod that
+                # Airbyte creates for a sync has no AWS identity of its own, so credentials
+                # arrive in the config. Passing None keeps the long-lived-key path unchanged,
+                # and boto3 then falls back to its default chain when no key is set at all.
                 self._s3_client = boto3.client(
                     "s3",
                     aws_access_key_id=self.config.aws_access_key_id,
                     aws_secret_access_key=self.config.aws_secret_access_key,
+                    aws_session_token=self.config.aws_session_token,
                     **client_kv_args,
                 )
 
@@ -133,13 +139,15 @@ class SourceS3StreamReader(AbstractFileBasedStreamReader):
         The method assumes a role specified in the `self.config.role_arn` and creates a session with the S3 service.
 
         Two ways to assume the role, tried in this order:
-          1. Web identity (TEL-21303): if the pod has a Kubernetes ServiceAccount token mounted at
-             AWS_WEB_IDENTITY_TOKEN_FILE_PATH, exchange it directly via STS AssumeRoleWithWebIdentity.
-             This needs no pre-existing AWS credentials at all -- the token itself is the credential --
-             so it works for a connector pod that Airbyte spun up with no AWS wiring of its own.
+          1. Web identity: if a Kubernetes ServiceAccount token happens to be mounted, exchange it
+             via STS AssumeRoleWithWebIdentity, which needs no pre-existing AWS credentials.
+             Note this only helps for check/discover pods. Replication pods set
+             automountServiceAccountToken: false, so no token is present during an actual sync --
+             which is why keyless sync auth goes through aws_session_token in the config instead of
+             through role_arn. See TEL-21303.
           2. Plain AssumeRole (legacy / Airbyte Cloud): requires the caller to already have some AWS
-             identity via boto3's default credential chain. Kept as-is for backward compatibility with
-             existing Airbyte Cloud usage, optionally scoped with AWS_ASSUME_ROLE_EXTERNAL_ID.
+             identity via boto3's default credential chain, optionally scoped with
+             AWS_ASSUME_ROLE_EXTERNAL_ID.
         """
 
         def refresh():
