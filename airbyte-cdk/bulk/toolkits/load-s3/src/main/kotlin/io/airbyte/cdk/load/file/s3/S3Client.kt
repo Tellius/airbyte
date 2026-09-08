@@ -8,6 +8,8 @@ import aws.sdk.kotlin.runtime.auth.credentials.AssumeRoleParameters
 import aws.sdk.kotlin.runtime.auth.credentials.DefaultChainCredentialsProvider
 import aws.sdk.kotlin.runtime.auth.credentials.StaticCredentialsProvider
 import aws.sdk.kotlin.runtime.auth.credentials.StsAssumeRoleCredentialsProvider
+import aws.sdk.kotlin.runtime.auth.credentials.StsWebIdentityCredentialsProvider
+import java.io.File
 import aws.sdk.kotlin.services.s3.model.CopyObjectRequest
 import aws.sdk.kotlin.services.s3.model.CreateMultipartUploadRequest
 import aws.sdk.kotlin.services.s3.model.Delete
@@ -42,6 +44,13 @@ import java.io.InputStream
 import kotlinx.coroutines.flow.flow
 
 private const val DELETE_BATCH_SIZE = 1000
+
+// TEL-21303: default path for the Kubernetes-projected ServiceAccount token every pod gets,
+// even one Airbyte spun up itself with no AWS-specific wiring of its own. When role_arn is set
+// and no static access key is given, we exchange this token for temporary AWS credentials via
+// STS AssumeRoleWithWebIdentity instead of requiring a separate bootstrap credential.
+private const val DEFAULT_WEB_IDENTITY_TOKEN_FILE_PATH =
+    "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
 data class S3Object(override val key: String, override val storageConfig: S3BucketConfiguration) :
     RemoteObject<S3BucketConfiguration> {
@@ -219,17 +228,47 @@ class S3ClientFactory(
 
         val credsProvider: CredentialsProvider =
             if (keyConfig.awsAccessKeyConfiguration.accessKeyId != null) {
+                // TEL-21303: session token is set when the caller passed short-lived STS
+                // credentials instead of long-lived IAM user keys. Leaving it null keeps the
+                // long-lived-key behaviour byte for byte.
+                if (keyConfig.awsAccessKeyConfiguration.sessionToken != null) {
+                    log.info {
+                        "Using temporary STS credentials supplied in the connector configuration"
+                    }
+                }
                 StaticCredentialsProvider {
                     accessKeyId = keyConfig.awsAccessKeyConfiguration.accessKeyId
                     secretAccessKey = keyConfig.awsAccessKeyConfiguration.secretAccessKey
+                    sessionToken = keyConfig.awsAccessKeyConfiguration.sessionToken
                 }
-            } else if (arnRole.awsArnRoleConfiguration.roleArn != null) {
-                // The Platform is expected to inject via credentials if ROLE_ARN is present.
+            } else if (
+                arnRole.awsArnRoleConfiguration.roleArn != null &&
+                    File(DEFAULT_WEB_IDENTITY_TOKEN_FILE_PATH).exists()
+            ) {
+                // TEL-21303: role_arn given, no static bootstrap credentials required -- the
+                // pod's own Kubernetes ServiceAccount token (mounted by default in every pod,
+                // no special wiring needed) is exchanged directly for temporary AWS credentials.
+                // This is what lets a connector job pod that Airbyte spun up on its own -- with
+                // no AWS env vars or projected token volume of its own -- still assume role_arn.
+                log.info {
+                    "role_arn is set; assuming it via STS web identity using the pod's default ServiceAccount token"
+                }
+                StsWebIdentityCredentialsProvider(
+                    roleArn = arnRole.awsArnRoleConfiguration.roleArn!!,
+                    webIdentityTokenFilePath = DEFAULT_WEB_IDENTITY_TOKEN_FILE_PATH,
+                    region = bucketConfig.s3BucketConfiguration.s3BucketRegion,
+                    roleSessionName = AIRBYTE_STS_SESSION_NAME,
+                )
+            } else if (
+                arnRole.awsArnRoleConfiguration.roleArn != null && assumeRoleCredentials != null
+            ) {
+                // Legacy path: role_arn given alongside a separate bootstrap credential the
+                // Platform injected (e.g. Airbyte Cloud). Kept for backward compatibility.
                 val assumeRoleParams =
                     AssumeRoleParameters(
                         roleArn = arnRole.awsArnRoleConfiguration.roleArn!!,
                         roleSessionName = AIRBYTE_STS_SESSION_NAME,
-                        externalId = assumeRoleCredentials!!.externalId,
+                        externalId = assumeRoleCredentials.externalId,
                     )
                 val creds = StaticCredentialsProvider {
                     accessKeyId = assumeRoleCredentials.accessKey

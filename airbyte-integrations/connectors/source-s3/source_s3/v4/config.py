@@ -33,6 +33,16 @@ class Config(AbstractFileBasedSpec):
         order=2,
     )
 
+    aws_session_token: Optional[str] = Field(
+        title="AWS Session Token",
+        default=None,
+        description="The session token that goes with a temporary access key pair issued by AWS STS. "
+        "Required when the access key ID and secret access key are short-lived credentials, and "
+        "omitted for long-lived IAM user keys.",
+        airbyte_secret=True,
+        order=4,
+    )
+
     role_arn: Optional[str] = Field(
         title=f"AWS Role ARN",
         default=None,
