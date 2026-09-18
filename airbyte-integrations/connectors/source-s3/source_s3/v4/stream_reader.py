@@ -106,10 +106,16 @@ class SourceS3StreamReader(AbstractFileBasedStreamReader):
             if self.config.role_arn:
                 self._s3_client = self._get_iam_s3_client(client_kv_args)
             else:
+                # TEL-21303: aws_session_token is set when the caller passed short-lived STS
+                # credentials rather than long-lived IAM user keys -- a connector job pod that
+                # Airbyte creates for a sync has no AWS identity of its own, so credentials
+                # arrive in the config. Passing None keeps the long-lived-key path unchanged,
+                # and boto3 then falls back to its default chain when no key is set at all.
                 self._s3_client = boto3.client(
                     "s3",
                     aws_access_key_id=self.config.aws_access_key_id,
                     aws_secret_access_key=self.config.aws_secret_access_key,
+                    aws_session_token=self.config.aws_session_token,
                     **client_kv_args,
                 )
 
@@ -125,7 +131,6 @@ class SourceS3StreamReader(AbstractFileBasedStreamReader):
         :return: An instance of a boto3 S3 client with the assumed role credentials.
 
         The method assumes a role specified in the `self.config.role_arn` and creates a session with the S3 service.
-        If `AWS_ASSUME_ROLE_EXTERNAL_ID` environment variable is set, it will be used during the role assumption for additional security.
         """
 
         def refresh():
