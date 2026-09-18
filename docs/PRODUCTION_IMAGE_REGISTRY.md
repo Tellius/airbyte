@@ -9,6 +9,16 @@ This document is the **single source of truth** for all custom Airbyte connector
 > 3. **Commit this file** alongside any connector/CDK code changes so the branch always reflects what's deployed.
 > 4. **Tag naming convention:** `<component>-tellius-release-<airbyte-base-version>-v<increment>` — always increment the `v` suffix; never reuse a tag.
 
+## Tellius Maintenance Branch
+
+All Tellius connector/CDK customisations are maintained on:
+
+```
+tellius-airbyte-release-1.8.0-v1
+```
+
+in the `Tellius/airbyte` fork. Every image in the tables below is built from this branch (or from a feature branch that targets it). Feature branches must be merged back into it so the branch always reflects what is deployed.
+
 ---
 
 ## Current Production Images
@@ -30,6 +40,7 @@ There are two ECR repositories in use:
 | **Azure Blob Storage** | `source-azure-blob-tellius-release-1.8.0-v3` | 2026-04-22 | `python-connector-base-tellius-release-v2` |
 | **S3** | `source-s3-tellius-release-1.8.0-v3` | 2026-04-22 | `python-connector-base-tellius-release-v2` |
 | **SharePoint** | `source-sharepoint-tellius-release-1.8.0-v2` | 2026-04-22 | `python-connector-base-tellius-release-v2` |
+| **S3 (dataset_upload)** | `source-s3-tellius-release-4.15.4-v2` | 2026-09-17 | `docker.io/airbyte/source-s3:4.15.4` |
 
 ### Manifest-Only Source Connectors
 
@@ -43,7 +54,7 @@ Declarative (YAML) connectors built on Airbyte's `source-declarative-manifest` r
 
 | Component | Current Tag | Date Deployed | Based On |
 |-----------|-------------|---------------|----------|
-| **Destination S3** | `destination-s3-tellius-release-1.8.0-v7` | 2026-06-01 | `docker.io/airbyte/java-connector-base:2.0.1` |
+| **Destination S3** | `destination-s3-tellius-release-1.8.0-v11` | 2026-09-17 | `docker.io/airbyte/java-connector-base:2.0.1` |
 
 ---
 
@@ -137,6 +148,19 @@ The custom base image extends Airbyte's official `python-connector-base` with:
 | `source-s3-tellius-release-1.8.0-v2` | 2026-04-13 | Rebuilt on `python-connector-base-tellius-release-v2`. Adds native DOCX/PPTX Mistral OCR support. |
 | `source-s3-tellius-release-1.8.0-v3` | 2026-04-22 | **Document Metadata feature.** Adds `_ab_source_file_content_type`, `_ab_source_file_prefix_path`, `_ab_source_file_size`, `_ab_source_file_storage_class`, `_ab_source_file_user_metadata`, `_ab_source_file_object_tags`. Eliminates redundant `head_object()` API call by reusing headers from `get_object()` response (N+1 fix). |
 
+#### S3 — dataset_upload lineage (`source-s3-tellius-release-4.15.4-*`)
+
+A **separate lineage** from the `1.8.0-*` images above. Those are the OCR-enabled fork used for
+customer S3 datasources (`CUSTOM_S3_SOURCE_DOCKER_IMAGE_TAG`). This one backs the internal
+`dataset_upload` source (`DATASET_UPLOAD_S3_SOURCE_DOCKER_IMAGE_TAG`) and is built on the **stock**
+`airbyte/source-s3:4.15.4`, not on the Tellius Python base — `dataset_upload` must keep stock
+parsing behaviour.
+
+| Tag | Date | Changes |
+|-----|------|---------|
+| `source-s3-tellius-release-4.15.4-v1` | 2026-09-07 | Initial build. Adds the `aws_session_token` spec field so the connector can read S3 with temporary STS credentials (TEL-21303). **Superseded — do not deploy.** |
+| `source-s3-tellius-release-4.15.4-v2` | 2026-09-17 | Rebuilt after review: the in-pod web-identity branch was dropped, so credentials arrive only via config. Spec diff vs stock `4.15.4` is `added: ['aws_session_token'], removed: none` — everything else identical. |
+
 ### SharePoint (`source-sharepoint-tellius-release-*`)
 
 | Tag | Date | Changes |
@@ -168,6 +192,8 @@ The custom base image extends Airbyte's official `python-connector-base` with:
 | `destination-s3-tellius-release-1.8.0-v5` | 2026-04-22 | **SharePoint metadata wiring.** Adds extraction of `_ab_source_file_site_name` → `site_name` and `_ab_source_file_library_name` → `library_name` into `meta_data`. Image moved from `release/airbyte` to `airbyte` ECR repository. |
 | `destination-s3-tellius-release-1.8.0-v6` | 2026-05-29 | **Slack metadata wiring.** Adds Slack-specific branch in `DocumentMetadataCollector` (`tryExtractFromSlackSource`) that produces middleware-notifiable `DocumentMetadata` for three streams: `channels`, `users`, and `channel_messages` (thread parents only). Each emits a real Slack permalink as `sourcePath` (`https://app.slack.com/...`), so links from Tellius UI deep-link back into Slack. Destination-side filters mirror the ingestion-side filters: skip deleted/bot/Slackbot users; skip system-event message subtypes (`channel_join`, `channel_leave`, `channel_archive`/`unarchive`, `channel_topic`/`purpose`/`name`, `bot_add`/`remove`); skip thread replies (parents only — replies are aggregated into the parent's UnifiedDocument by the airflow SlackExtractor). |
 | `destination-s3-tellius-release-1.8.0-v7` | 2026-06-01 | **Granola metadata wiring.** Adds `tryExtractFromGranolaSource` branch in `DocumentMetadataCollector` (routed before the generic API extractor). Emits middleware-notifiable `DocumentMetadata` only for `detailed_notes` records (rich content: `summary_markdown`/`summary_text`/`transcript`/`attendees`); skips the light `notes` index stream (used by the airflow GranolaExtractor as enrichment only). `type = granola_note`; `sourcePath` resolves to the real Granola permalink (`https://notes.granola.ai/d/{uuid}`) via the `web_url` field declared in the source manifest. |
+| `destination-s3-tellius-release-1.8.0-v8` — `v10` | 2026-09 | Intermediate TEL-21303 builds. **Superseded — never deployed to production.** |
+| `destination-s3-tellius-release-1.8.0-v11` | 2026-09-17 | **Temporary STS credentials (TEL-21303).** Adds an optional `session_token` to the connector spec and passes it through `StaticCredentialsProvider`, so the destination can write to S3 without long-lived IAM user keys. A replication job pod has no AWS identity of its own (`automountServiceAccountToken: false`, no AWS env, no mounted secrets), so credentials must travel in its config. Optional and defaults to null — behaviour with long-lived keys is unchanged. |
 
 ---
 
